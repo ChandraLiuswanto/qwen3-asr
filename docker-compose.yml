@@ -9,6 +9,7 @@ services:
     volumes:
       - ./temp:/app/temp
       - ./logs:/app/logs
+      - ./data:/app/data
       - ./models/modelscope:/root/.cache/modelscope
       - ./models/huggingface:/root/.cache/huggingface
     runtime: nvidia
@@ -18,6 +19,9 @@ services:
       HF_HOME: /root/.cache/huggingface
       HF_HUB_LOCAL_FILES_ONLY: ${HF_HUB_LOCAL_FILES_ONLY:-0}
       QWEN3_ASR_MODEL: ${QWEN3_ASR_MODEL:-}
+      VOICEPRINT_ENABLED: ${VOICEPRINT_ENABLED:-true}
+      VOICEPRINT_DB_PATH: ${VOICEPRINT_DB_PATH:-./data/voiceprints.sqlite3}
+      VOICEPRINT_MATCH_THRESHOLD: ${VOICEPRINT_MATCH_THRESHOLD:-0.70}
       NVIDIA_VISIBLE_DEVICES: all
       CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-0}
       NGINX_RATE_LIMIT_RPS: ${NGINX_RATE_LIMIT_RPS:-0}

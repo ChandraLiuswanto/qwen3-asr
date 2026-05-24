@@ -30,9 +30,9 @@ Speech recognition API service centered on [Qwen3-ASR](https://github.com/QwenLM
 
 <img src="./demo/contact.jpg" alt="WeChat QR code" width="220">
 
-## Release 1.0.1
+## Release 1.0.2
 
-> `v1.0.1` is the current patch release. `v1.0.0` introduced a large breaking refactor relative to the earlier `main` branch.
+> `v1.0.2` adds the persistent voiceprint database backed by local sqlite-vec storage. `v1.0.0` introduced a large breaking refactor relative to the earlier `main` branch.
 > If you are upgrading from `main`, read the release notes before reusing old deployment assumptions.
 >
 > Key breaking changes:
@@ -41,11 +41,17 @@ Speech recognition API service centered on [Qwen3-ASR](https://github.com/QwenLM
 > - `MLX` / Apple Silicon GPU path has been removed; `mps` is normalized to `cpu`
 > - macOS / Apple Silicon now defaults to `qwen3-asr-0.6b`; set `QWEN3_ASR_MODEL` to override it
 > - `ENABLED_MODELS` has been removed
+>
+> Voiceprint changes in `v1.0.2`:
+> - Voiceprint matching is enabled by deployment configuration, not by ASR request parameters
+> - Voiceprint vectors are stored in SQLite through `sqlite-vec`; PostgreSQL/pgvector is no longer used
+> - Docker Compose persists the voiceprint database under `./data`
 
 ## Features
 
 - **Hybrid Runtime Stack** - Uses auto-selected Qwen3-ASR for offline inference and Paraformer realtime for websocket streaming
 - **Speaker Diarization** - Automatic multi-speaker identification using CAM++ model
+- **Voiceprint Database** - Persistent speaker identity matching with sqlite-vec, using existing `speaker_id` fields
 - **OpenAI API Compatible** - Supports `/v1/audio/transcriptions` endpoint, works with OpenAI SDK
 - **Alibaba Cloud API Compatible** - Supports Alibaba Cloud Speech RESTful API and WebSocket streaming protocol
 - **WebSocket Streaming** - Real-time streaming speech recognition with low latency
@@ -95,13 +101,17 @@ docker run -d --name qwen3-asr \
   -p 17003:8000 \
   -e CUDA_VISIBLE_DEVICES=0,1,2,3 \
   -e API_KEY=your_api_key \
+  -e VOICEPRINT_ENABLED=true \
   -v ./models/modelscope:/root/.cache/modelscope \
   -v ./models/huggingface:/root/.cache/huggingface \
+  -v ./data:/app/data \
   quantatrisk/qwen3-asr:gpu-latest
 
 # CPU version
 docker run -d --name qwen3-asr \
   -p 17003:8000 \
+  -e VOICEPRINT_ENABLED=true \
+  -v ./data:/app/data \
   quantatrisk/qwen3-asr:cpu-latest
 ```
 
@@ -348,6 +358,47 @@ Disable speaker diarization:
 ?enable_speaker_diarization=false
 ```
 
+## Voiceprint Database
+
+Persistent speaker identity matching is available in `v1.0.2`. The ASR response
+schema is unchanged: matched identities replace the existing `speaker_id` value,
+and uncertain matches keep the local diarization label.
+
+- **Enabled by Deployment** - Controlled by `VOICEPRINT_ENABLED`, not request parameters
+- **Local Vector Store** - Uses SQLite plus `sqlite-vec`; no external PostgreSQL service is required
+- **Multiple Samples per Speaker** - Register several single-speaker clips for the same identity
+- **Conservative Matching** - Internal score uses `max_score * 0.7 + top3_mean_score * 0.3`
+
+Create a speaker with one or more voiceprint samples:
+
+```bash
+curl -X POST 'http://localhost:8000/api/v1/voiceprint-speakers' \
+  -F 'display_name=Alice' \
+  -F 'file=@tests/files/voiceprint_samples/dialogue_speaker_01_reference.wav'
+```
+
+Add more samples to an existing speaker:
+
+```bash
+curl -X POST 'http://localhost:8000/api/v1/voiceprint-speakers/{speaker_id}/samples' \
+  -F 'file=@tests/files/voiceprint_samples/dialogue_speaker_02_reference.wav'
+```
+
+List registered speakers:
+
+```bash
+curl 'http://localhost:8000/api/v1/voiceprint-speakers'
+```
+
+Soft-delete a speaker:
+
+```bash
+curl -X DELETE 'http://localhost:8000/api/v1/voiceprint-speakers/{speaker_id}'
+```
+
+See [docs/voiceprint-architecture.md](docs/voiceprint-architecture.md) for
+storage and matching design details.
+
 ## Audio Processing
 
 ### Intelligent Segmentation Strategy
@@ -415,6 +466,9 @@ Recommended public settings:
 | `MAX_SEGMENT_SEC` | `60` | Max audio segment duration (seconds) |
 | `ASR_ENABLE_NEARFIELD_FILTER` | `true` | Enable far-field sound filtering |
 | `QWEN3_ASR_MODEL` | auto | Force `qwen3-asr-1.7b` or `qwen3-asr-0.6b` instead of VRAM-based selection |
+| `VOICEPRINT_ENABLED` | `true` | Enable persistent voiceprint matching during ASR enrichment |
+| `VOICEPRINT_DB_PATH` | `./data/voiceprints.sqlite3` | SQLite voiceprint database path |
+| `VOICEPRINT_MATCH_THRESHOLD` | `0.70` | Speaker identity match threshold |
 
 Far-field filter notes:
 

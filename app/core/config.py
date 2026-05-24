@@ -14,7 +14,7 @@ class Settings:
 
     # 应用信息
     APP_NAME: str = "Qwen3-ASR Server"
-    APP_VERSION: str = "1.0.1"
+    APP_VERSION: str = "1.0.2"
     APP_DESCRIPTION: str = "Qwen3-ASR speech recognition API service"
 
     # 服务器配置
@@ -75,6 +75,11 @@ class Settings:
     QWEN_RUST_ASR_CONCURRENCY: int = 0
     QWEN_RUST_ALIGN_CONCURRENCY: int = 0
     FUNASR_WORKERS: int = 1
+
+    # Voiceprint identification configuration.
+    VOICEPRINT_ENABLED: bool = True
+    VOICEPRINT_DB_PATH: str = str(BASE_DIR / "data" / "voiceprints.sqlite3")
+    VOICEPRINT_MATCH_THRESHOLD: float = 0.70
 
     def __init__(self):
         """从环境变量读取配置"""
@@ -147,6 +152,20 @@ class Settings:
         )
         self.FUNASR_WORKERS = int(
             os.getenv("FUNASR_WORKERS", str(self.FUNASR_WORKERS))
+        )
+
+        self.VOICEPRINT_ENABLED = (
+            os.getenv("VOICEPRINT_ENABLED", str(self.VOICEPRINT_ENABLED)).lower()
+            in {"1", "true", "yes", "on"}
+        )
+        self.VOICEPRINT_DB_PATH = (
+            os.getenv("VOICEPRINT_DB_PATH") or self.VOICEPRINT_DB_PATH
+        ).strip()
+        self.VOICEPRINT_MATCH_THRESHOLD = float(
+            os.getenv(
+                "VOICEPRINT_MATCH_THRESHOLD",
+                str(self.VOICEPRINT_MATCH_THRESHOLD),
+            )
         )
 
     def _parse_size(self, size_str: str) -> int:

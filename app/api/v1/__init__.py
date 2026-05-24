@@ -5,6 +5,7 @@ from fastapi import APIRouter
 from .asr import router as asr_router
 from .websocket_asr import router as websocket_asr_router
 from .openai_compatible import router as openai_router
+from .voiceprints import router as voiceprints_router
 
 api_router = APIRouter()
 
@@ -16,3 +17,6 @@ api_router.include_router(websocket_asr_router)
 
 # OpenAI 兼容 API
 api_router.include_router(openai_router)
+
+# Voiceprint management API
+api_router.include_router(voiceprints_router)

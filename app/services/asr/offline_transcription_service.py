@@ -4,15 +4,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from typing import Optional
 
 from fastapi import Request
 
+from app.core.config import settings
 from app.models.common import SampleRate
 from app.services.asr.engines import ASRFullResult
 from app.services.asr.model_selection import get_default_offline_model_id
 from app.services.asr.runtime import OfflineASRRequest, get_runtime_router
 from app.services.audio import get_audio_service
+from app.services.speaker import get_speaker_identification_service
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -86,7 +92,7 @@ class OfflineTranscriptionService:
         options: OfflineTranscriptionOptions,
     ) -> ASRFullResult:
         model_id = get_default_offline_model_id()
-        return await get_runtime_router().run_offline(
+        result = await get_runtime_router().run_offline(
             OfflineASRRequest(
                 model_id=model_id,
                 audio_path=prepared_audio.normalized_path,
@@ -100,6 +106,22 @@ class OfflineTranscriptionService:
                 task_id=options.task_id,
             )
         )
+        if not settings.VOICEPRINT_ENABLED:
+            return result
+
+        try:
+            return get_speaker_identification_service().enrich_asr_result(
+                audio_path=prepared_audio.normalized_path,
+                asr_result=result,
+                timestamp_scale=prepared_audio.timestamp_scale,
+                task_id=options.task_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Voiceprint service unavailable; keep diarization labels: %s",
+                exc,
+            )
+            return result
 
     def cleanup(self, prepared_audio: Optional[PreparedAudio]) -> None:
         if prepared_audio is None:

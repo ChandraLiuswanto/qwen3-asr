@@ -31,9 +31,10 @@ docker run -d --name qwen3-asr \
   -p 17003:8000 \
   -v ./models/modelscope:/root/.cache/modelscope \
   -v ./models/huggingface:/root/.cache/huggingface \
+  -v ./data:/app/data \
   -v ./logs:/app/logs \
   -v ./temp:/app/temp \
-  -e DEVICE=auto \
+  -e VOICEPRINT_ENABLED=true \
   quantatrisk/qwen3-asr:gpu-latest
 
 # 或使用 docker-compose（推荐）
@@ -71,9 +72,10 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 docker-compose up -d
 docker run -d --name qwen3-asr \
   -p 17003:8000 \
   -v ./models/modelscope:/root/.cache/modelscope \
+  -v ./data:/app/data \
   -v ./logs:/app/logs \
   -v ./temp:/app/temp \
-  -e DEVICE=cpu \
+  -e VOICEPRINT_ENABLED=true \
   quantatrisk/qwen3-asr:cpu-latest
 ```
 
@@ -138,7 +140,7 @@ curl -X POST "http://localhost:17003/v1/audio/transcriptions" \
 ./build.sh -t gpu
 
 # 构建指定版本并推送
-./build.sh -t all -v 1.0.1 -p
+./build.sh -t all -v 1.0.2 -p
 
 # 查看帮助
 ./build.sh -h
@@ -253,6 +255,7 @@ uv run python -m app.utils.download_models --export-dir ./models
 volumes:
   - ./models/modelscope:/root/.cache/modelscope
   - ./models/huggingface:/root/.cache/huggingface
+  - ./data:/app/data
 ```
 
 ## 环境变量配置
@@ -288,6 +291,14 @@ volumes:
 | 环境变量 | 默认值 | 说明 |
 |----------|--------|------|
 | `ASR_ENABLE_REALTIME_PUNC` | `true` | 是否启用实时标点模型 |
+
+### 声纹数据库配置
+
+| 环境变量 | 默认值 | 说明 |
+|----------|--------|------|
+| `VOICEPRINT_ENABLED` | `true` | 是否启用 ASR 结果声纹身份匹配 |
+| `VOICEPRINT_DB_PATH` | `./data/voiceprints.sqlite3` | SQLite + sqlite-vec 声纹数据库路径 |
+| `VOICEPRINT_MATCH_THRESHOLD` | `0.70` | 说话人身份匹配阈值 |
 
 ### 性能优化配置
 
@@ -358,15 +369,15 @@ services:
     volumes:
       - ./models/modelscope:/root/.cache/modelscope
       - ./models/huggingface:/root/.cache/huggingface
+      - ./data:/app/data
       - ./temp:/app/temp
       - ./logs:/app/logs
     environment:
-      - DEBUG=false
       - LOG_LEVEL=INFO
-      - DEVICE=auto
+      - VOICEPRINT_ENABLED=true
+      - VOICEPRINT_DB_PATH=./data/voiceprints.sqlite3
+      - VOICEPRINT_MATCH_THRESHOLD=0.70
       - ASR_BATCH_SIZE=4
-      - WORKERS=1
-      - INFERENCE_THREAD_POOL_SIZE=4
     restart: unless-stopped
     deploy:
       resources:
@@ -388,14 +399,14 @@ services:
       - "17003:8000"
     volumes:
       - ./models/modelscope:/root/.cache/modelscope
+      - ./data:/app/data
       - ./temp:/app/temp
       - ./logs:/app/logs
     environment:
-      - DEBUG=false
       - LOG_LEVEL=INFO
-      - DEVICE=cpu
-      - WORKERS=1
-      - INFERENCE_THREAD_POOL_SIZE=1
+      - VOICEPRINT_ENABLED=true
+      - VOICEPRINT_DB_PATH=./data/voiceprints.sqlite3
+      - VOICEPRINT_MATCH_THRESHOLD=0.70
     restart: unless-stopped
 ```
 
@@ -421,8 +432,9 @@ services:
       - CUDA_VISIBLE_DEVICES=0,1
       - NGINX_RATE_LIMIT_RPS=20
       - NGINX_RATE_LIMIT_BURST=40
-      - WORKERS=1
-      - INFERENCE_THREAD_POOL_SIZE=4
+      - VOICEPRINT_ENABLED=true
+      - VOICEPRINT_DB_PATH=./data/voiceprints.sqlite3
+      - VOICEPRINT_MATCH_THRESHOLD=0.70
       - ASR_BATCH_SIZE=4
     restart: unless-stopped
     deploy:

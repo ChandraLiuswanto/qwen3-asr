@@ -1,6 +1,6 @@
 [project]
 name = "qwen3-asr"
-version = "1.0.1"
+version = "1.0.2"
 description = "Qwen3-ASR API service with CUDA vLLM and CPU Rust backends"
 requires-python = ">=3.10,<3.13"
 dependencies = [
@@ -31,6 +31,7 @@ dependencies = [
   "torchvision==0.25.0 ; sys_platform == 'linux'",
   "transformers>=4.57,<4.58",
   "vllm[audio]==0.19.0 ; sys_platform == 'linux'",
+  "sqlite-vec>=0.1.9,<0.2",
 ]
 
 [build-system]

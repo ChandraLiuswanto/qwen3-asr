@@ -1,6 +1,6 @@
 [project]
 name = "qwen3-asr-cpu-env"
-version = "1.0.0"
+version = "1.0.2"
 description = "CPU runtime environment for qwen3-asr"
 requires-python = ">=3.10,<3.13"
 dependencies = [
@@ -29,6 +29,7 @@ dependencies = [
   "torch==2.3.1 ; sys_platform == 'linux' or sys_platform == 'darwin'",
   "torchaudio==2.3.1 ; sys_platform == 'linux' or sys_platform == 'darwin'",
   "transformers>=4.45,<4.50",
+  "sqlite-vec>=0.1.9,<0.2",
 ]
 
 [build-system]

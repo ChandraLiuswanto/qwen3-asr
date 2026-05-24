@@ -28,9 +28,9 @@
 
 <img src="../demo/contact.jpg" alt="微信二维码" width="220">
 
-## Release 1.0.1
+## Release 1.0.2
 
-> `v1.0.1` 是当前补丁版本。`v1.0.0` 相对于早期 `main` 分支引入了一轮大规模 breaking refactor。
+> `v1.0.2` 新增基于 sqlite-vec 的持久化声纹数据库。`v1.0.0` 相对于早期 `main` 分支引入了一轮大规模 breaking refactor。
 > 如果你是从 `main` 升级过来，请先阅读 release 说明，再决定是否沿用旧的部署与运行时假设。
 >
 > 关键 breaking changes：
@@ -39,11 +39,17 @@
 > - `MLX` / Apple Silicon GPU 路径已移除，`mps` 会归一化到 `cpu`
 > - macOS / Apple Silicon 现在默认总是 `qwen3-asr-0.6b`，可通过 `QWEN3_ASR_MODEL` 覆盖
 > - `ENABLED_MODELS` 已移除
+>
+> `v1.0.2` 声纹变更：
+> - 声纹匹配由部署环境变量控制，不由 ASR 请求参数控制
+> - 声纹向量使用 SQLite + `sqlite-vec` 存储，不再依赖 PostgreSQL/pgvector
+> - Docker Compose 会将声纹数据库持久化到 `./data`
 
 ## 主要特性
 
 - **混合运行时栈** - 离线推理由自动选择的 Qwen3-ASR 提供，WebSocket 流式由 Paraformer realtime 能力提供
 - **说话人分离** - 基于 CAM++ 模型自动识别多说话人，返回说话人标记
+- **声纹数据库** - 基于 sqlite-vec 持久化说话人身份匹配，复用现有 `speaker_id` 字段
 - **OpenAI API 兼容** - 支持 `/v1/audio/transcriptions` 端点，可直接使用 OpenAI SDK
 - **阿里云 API 兼容** - 支持阿里云语音识别 RESTful API 和 WebSocket 流式协议
 - **WebSocket 流式识别** - 支持实时流式语音识别，低延迟
@@ -93,13 +99,17 @@ docker run -d --name qwen3-asr \
   -p 17003:8000 \
   -e CUDA_VISIBLE_DEVICES=0,1,2,3 \
   -e API_KEY=your_api_key \
+  -e VOICEPRINT_ENABLED=true \
   -v ./models/modelscope:/root/.cache/modelscope \
   -v ./models/huggingface:/root/.cache/huggingface \
+  -v ./data:/app/data \
   quantatrisk/qwen3-asr:gpu-latest
 
 # CPU 版本
 docker run -d --name qwen3-asr \
   -p 17003:8000 \
+  -e VOICEPRINT_ENABLED=true \
+  -v ./data:/app/data \
   quantatrisk/qwen3-asr:cpu-latest
 ```
 
@@ -348,6 +358,45 @@ curl -X POST "http://localhost:8000/stream/v1/asr?enable_speaker_diarization=tru
 ?enable_speaker_diarization=false
 ```
 
+## 声纹数据库
+
+`v1.0.2` 支持持久化说话人身份匹配。ASR 响应结构不变：命中声纹时替换现有
+`speaker_id`，不确定时保留本地说话人分离标签。
+
+- **部署侧启用** - 由 `VOICEPRINT_ENABLED` 控制，不增加请求参数
+- **本地向量库** - 使用 SQLite + `sqlite-vec`，无需额外 PostgreSQL 服务
+- **同一说话人多样本** - 可为一个 speaker 注册多段单人音频
+- **保守匹配策略** - 内部分数为 `max_score * 0.7 + top3_mean_score * 0.3`
+
+创建说话人并注册一个或多个声纹样本：
+
+```bash
+curl -X POST 'http://localhost:8000/api/v1/voiceprint-speakers' \
+  -F 'display_name=Alice' \
+  -F 'file=@tests/files/voiceprint_samples/dialogue_speaker_01_reference.wav'
+```
+
+给已有说话人追加样本：
+
+```bash
+curl -X POST 'http://localhost:8000/api/v1/voiceprint-speakers/{speaker_id}/samples' \
+  -F 'file=@tests/files/voiceprint_samples/dialogue_speaker_02_reference.wav'
+```
+
+查看已注册说话人：
+
+```bash
+curl 'http://localhost:8000/api/v1/voiceprint-speakers'
+```
+
+软删除说话人：
+
+```bash
+curl -X DELETE 'http://localhost:8000/api/v1/voiceprint-speakers/{speaker_id}'
+```
+
+存储结构和匹配策略详见 [voiceprint-architecture.md](voiceprint-architecture.md)。
+
 ## 音频处理
 
 ### 智能分段策略
@@ -415,6 +464,9 @@ curl -X POST "http://localhost:8000/stream/v1/asr?enable_speaker_diarization=tru
 | `MAX_SEGMENT_SEC`                | `60`         | 音频分段最大时长（秒）                        |
 | `ASR_ENABLE_NEARFIELD_FILTER`    | `true`       | 启用远场声音过滤                              |
 | `QWEN3_ASR_MODEL`                | 自动选择      | 强制选择 `qwen3-asr-1.7b` 或 `qwen3-asr-0.6b` |
+| `VOICEPRINT_ENABLED`             | `true`       | 启用 ASR 结果声纹身份匹配                     |
+| `VOICEPRINT_DB_PATH`             | `./data/voiceprints.sqlite3` | SQLite 声纹数据库路径          |
+| `VOICEPRINT_MATCH_THRESHOLD`     | `0.70`       | 说话人身份匹配阈值                            |
 
 远场过滤调优建议：
 
