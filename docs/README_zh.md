@@ -364,6 +364,8 @@ curl -X POST "http://localhost:8000/stream/v1/asr?enable_speaker_diarization=tru
 - ✅ 字句级时间戳
 - ❌ **词级时间戳**（FunASR realtime 路径未实现）
 - ❌ **置信度分数**（未实现）
+- 音频入口固定保留最多 10 秒待处理数据；队列满时会对 WebSocket 发送端施加背压，不会静默丢弃音频。客户端应持续读取识别事件并增量发送。
+- 该路径使用 Paraformer，离线接口使用 Qwen3-ASR；应在同一路径内比较延迟，不能直接比较两者总吞吐。
 
 **Qwen3-ASR 流式**（使用 `/ws/v1/asr/qwen`）：
 - ✅ 支持多语言实时识别

@@ -140,8 +140,8 @@ class ASRWebSocketClient(BaseWebSocketClient):
             await self.send_bytes(chunk)
             offset += self.chunk_bytes
 
-            # 以接近实时的速度发送 (稍快一些)
-            await asyncio.sleep(chunk_duration * 0.5)
+            # Preserve the audio clock so latency measurements reflect the service.
+            await asyncio.sleep(chunk_duration)
 
         # 发送 StopTranscription
         await self._send_stop_transcription()
@@ -196,7 +196,7 @@ class ASRWebSocketClient(BaseWebSocketClient):
             filename = f"{self.task_id[:8]}_{int(self.audio_duration_ms)}ms.txt"
             filepath = self.save_result_dir / filename
 
-            with open(filepath, 'w', encoding='utf-8') as f:
+            with open(filepath, "w", encoding="utf-8") as f:
                 f.write(result_text)
 
             logger.debug(f"识别结果已保存: {filepath}")

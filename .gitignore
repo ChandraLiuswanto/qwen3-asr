@@ -56,7 +56,10 @@ coverage.xml
 .hypothesis/
 .pytest_cache/
 .venv-fastapi-test/
-tests/
+
+# Local test media and vendored upstream test suites are not project sources.
+tests/files/
+vendor/qwenasr/crates/qwen-asr/tests/
 
 # Translations
 *.mo

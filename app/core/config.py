@@ -40,9 +40,6 @@ class Settings:
     LOG_MAX_BYTES: int = 20 * 1024 * 1024  # 20MB
     LOG_BACKUP_COUNT: int = 50  # 保留50个备份文件
 
-    # ASR模型配置
-    WS_MAX_BUFFER_SIZE: int = 10 * 16000  # WebSocket音频缓冲区最大大小（10秒@16kHz）
-
     FUNASR_AUTOMODEL_KWARGS = {
         "trust_remote_code": False,
         "disable_update": True,
@@ -98,11 +95,6 @@ class Settings:
 
         # 设备配置
         self.DEVICE = os.getenv("DEVICE", self.DEVICE)
-
-        # WebSocket缓冲区配置
-        self.WS_MAX_BUFFER_SIZE = int(
-            os.getenv("WS_MAX_BUFFER_SIZE", str(self.WS_MAX_BUFFER_SIZE))
-        )
 
         # 远场过滤配置
         self.ASR_ENABLE_NEARFIELD_FILTER = (

@@ -1,14 +1,18 @@
 # -*- coding: utf-8 -*-
 """Aliyun-compatible FunASR websocket service."""
 
+import asyncio
+import io
 import json
 import logging
+from collections import deque
+from contextlib import suppress
+from dataclasses import dataclass, field
+from enum import IntEnum
+from typing import TYPE_CHECKING, Any, Deque, Dict, Optional, cast
+
 import numpy as np
 import soundfile as sf
-import io
-from contextlib import suppress
-from typing import Any, Optional, Dict, TYPE_CHECKING, cast
-from enum import IntEnum
 
 from fastapi import WebSocketDisconnect
 
@@ -35,6 +39,7 @@ from .asr.engines import (
 )
 
 logger = logging.getLogger(__name__)
+MAX_PENDING_AUDIO_SECONDS = 10
 
 
 class ConnectionState(IntEnum):
@@ -42,6 +47,93 @@ class ConnectionState(IntEnum):
 
     READY = 1
     STARTED = 2
+
+
+@dataclass
+class _AudioSession:
+    """Mutable recognition state owned by one sequential worker."""
+
+    task_id: str
+    params: dict[str, Any]
+    audio_cache: Dict[Any, Any]
+    audio_buffer: np.ndarray
+    sentence_index: int = 0
+    audio_time: int = 0
+    sentence_active: bool = False
+    sentence_start_time: int = 0
+    last_sentence_text: str = ""
+    sentence_texts: list[str] = field(default_factory=list)
+    sentence_texts_raw: list[str] = field(default_factory=list)
+    empty_result_count: int = 0
+
+
+class _BoundedAudioQueue:
+    """FIFO queue that applies backpressure by total queued audio samples."""
+
+    def __init__(self, max_samples: int):
+        self._max_samples = max(1, max_samples)
+        self._queued_samples = 0
+        self._items: Deque[np.ndarray] = deque()
+        self._finished = False
+        self._aborted = False
+        self._condition = asyncio.Condition()
+
+    async def put(self, audio: np.ndarray) -> float:
+        sample_count = len(audio)
+        if sample_count == 0:
+            return 0.0
+        if sample_count > self._max_samples:
+            raise ValueError(
+                f"Audio frame has {sample_count} samples, exceeding the {self._max_samples} sample limit"
+            )
+
+        async with self._condition:
+            blocked_at: Optional[float] = None
+            while (
+                not self._finished
+                and not self._aborted
+                and self._queued_samples + sample_count > self._max_samples
+            ):
+                if blocked_at is None:
+                    blocked_at = asyncio.get_running_loop().time()
+                await self._condition.wait()
+
+            if self._finished or self._aborted:
+                raise RuntimeError("Audio queue is closed")
+
+            self._items.append(audio)
+            self._queued_samples += sample_count
+            self._condition.notify()
+            if blocked_at is None:
+                return 0.0
+            return asyncio.get_running_loop().time() - blocked_at
+
+    async def get(self) -> Optional[np.ndarray]:
+        async with self._condition:
+            while not self._items and not self._finished and not self._aborted:
+                await self._condition.wait()
+
+            if self._aborted:
+                return None
+            if not self._items:
+                return None
+
+            audio = self._items.popleft()
+            self._queued_samples -= len(audio)
+            self._condition.notify_all()
+            return audio
+
+    async def finish(self) -> None:
+        async with self._condition:
+            self._finished = True
+            self._condition.notify_all()
+
+    async def abort(self) -> None:
+        async with self._condition:
+            self._aborted = True
+            self._items.clear()
+            self._queued_samples = 0
+            self._condition.notify_all()
 
 
 class AliyunWebSocketASRService:
@@ -68,406 +160,355 @@ class AliyunWebSocketASRService:
         assert self.asr_engine is not None, "ASR引擎初始化失败"
         return self.asr_engine
 
-    async def handle_connection(self, websocket, task_id: str):
-        """处理WebSocket连接"""
+    async def handle_connection(self, websocket, task_id: str) -> None:
+        """Handle protocol messages while one worker processes audio in order."""
         state = ConnectionState.READY
         session_id = f"session_{task_id}"
-        transcription_params = None
-        audio_cache = {}
-        sentence_index = 0
-        audio_time = 0
-        sentence_active = False
-        sentence_start_time = 0
-        last_sentence_text = ""
-        sentence_texts = []
-        sentence_texts_raw = []
-        empty_result_count = 0
-        audio_buffer = np.array([], dtype=np.float32)  # 音频缓冲区，用于累积到完整chunk
-        max_buffer_size = settings.WS_MAX_BUFFER_SIZE  # 最大缓冲区大小（样本数）
+        audio_queue: Optional[_BoundedAudioQueue] = None
+        audio_worker: Optional[asyncio.Task[None]] = None
+        session: Optional[_AudioSession] = None
 
-        logger.info(f"[{task_id}] WebSocket ASR连接开始")
+        logger.info("[%s] WebSocket ASR connected", task_id)
 
         try:
-            result, message = validate_websocket_token(websocket, task_id)
-            if not result:
-                await self._send_task_failed(websocket, task_id, message)
+            is_valid, validation_message = validate_websocket_token(websocket, task_id)
+            if not is_valid:
+                await self._send_task_failed(websocket, task_id, validation_message)
                 return
 
-            self.engine_lease = await get_runtime_router().acquire_engine("paraformer-large")
+            self.engine_lease = await get_runtime_router().acquire_engine(
+                "paraformer-large"
+            )
             self.asr_engine = self.engine_lease.engine
             if not self.asr_engine.supports_realtime:
-                raise Exception("当前ASR引擎不支持实时识别")
-            logger.info("WebSocket ASR引擎: 使用 paraformer-large")
+                raise RuntimeError(
+                    "The configured ASR engine does not support realtime recognition"
+                )
+            logger.info("WebSocket ASR engine: paraformer-large")
 
             while True:
-                message = await websocket.receive()
+                message = await self._receive_message_or_worker_failure(
+                    websocket, audio_worker
+                )
+                if message.get("type") == "websocket.disconnect":
+                    raise WebSocketDisconnect(
+                        code=message.get("code", 1006),
+                        reason=message.get("reason", ""),
+                    )
 
                 if "text" in message:
-                    try:
-                        data = json.loads(message["text"])
-                        logger.debug(
-                            f"[{task_id}] 收到消息: {data.get('header', {}).get('name', '')}"
+                    data = json.loads(message["text"])
+                    header = data.get("header", {})
+                    message_name = header.get("name", "")
+                    message_task_id = header.get("task_id", "")
+                    namespace = header.get("namespace", "")
+
+                    if namespace != AliyunASRNamespace.SPEECH_TRANSCRIBER:
+                        await self._send_task_failed(
+                            websocket, task_id, "Invalid namespace"
                         )
+                        continue
 
-                        header = data.get("header", {})
-                        message_name = header.get("name", "")
-                        message_task_id = header.get("task_id", "")
-                        namespace = header.get("namespace", "")
-
-                        if namespace != AliyunASRNamespace.SPEECH_TRANSCRIBER:
+                    if message_name == AliyunASRMessageName.START_TRANSCRIPTION:
+                        if state != ConnectionState.READY:
                             await self._send_task_failed(
-                                websocket, task_id, "Invalid namespace"
+                                websocket, task_id, "Connection already started"
                             )
                             continue
 
-                        if message_name == AliyunASRMessageName.START_TRANSCRIPTION:
-                            if state == ConnectionState.READY:
-                                transcription_params = self._parse_start_transcription(
-                                    data, task_id
-                                )
-                                task_id = message_task_id or task_id
-                                await self._send_transcription_started(
-                                    websocket, task_id, session_id
-                                )
-                                state = ConnectionState.STARTED
-                                sentence_index = 0
-                                audio_time = 0
-                                sentence_active = False
-                                sentence_start_time = 0
-                                last_sentence_text = ""
-                                sentence_texts = []
-                                sentence_texts_raw = []
-                                empty_result_count = 0
-                            else:
-                                await self._send_task_failed(
-                                    websocket, task_id, "Connection already started"
-                                )
-
-                        elif message_name == AliyunASRMessageName.STOP_TRANSCRIPTION:
-                            if state == ConnectionState.STARTED:
-                                if message_task_id != task_id:
-                                    await self._send_task_failed(
-                                        websocket, task_id, "Task ID not match"
-                                    )
-                                    continue
-
-                                # 确保 transcription_params 已设置
-                                if not transcription_params:
-                                    await self._send_task_failed(
-                                        websocket, task_id, "StartTranscription not received"
-                                    )
-                                    continue
-
-                                # 如果有未完成的句子，直接结束
-                                if sentence_active and sentence_texts_raw:
-                                    sentence_index += 1
-                                    full_sentence_text = "".join(sentence_texts_raw)
-
-                                    if transcription_params.get(
-                                        "enable_punctuation_prediction", True
-                                    ):
-                                        full_sentence_text = await self._apply_final_punctuation_to_sentence(
-                                            full_sentence_text, task_id
-                                        )
-
-                                    await self._send_sentence_end(
-                                        websocket,
-                                        task_id,
-                                        sentence_index,
-                                        audio_time,
-                                        full_sentence_text,
-                                        sentence_start_time,
-                                        enable_itn=transcription_params.get(
-                                            "enable_inverse_text_normalization", True
-                                        ),
-                                    )
-
-                                await self._send_transcription_completed(
-                                    websocket, task_id
-                                )
-                                logger.info(f"[{task_id}] 识别完成")
-                                break
-                            else:
-                                await self._send_task_failed(
-                                    websocket, task_id, "Connection not started"
-                                )
-                        else:
-                            await self._send_task_failed(
-                                websocket,
-                                task_id,
-                                f"Invalid message name: {message_name}",
-                            )
-
-                    except json.JSONDecodeError as e:
-                        logger.error(f"[{task_id}] JSON解析错误: {e}")
-                        await self._send_task_failed(
-                            websocket, task_id, f"Message Not Json: {message}"
+                        params = self._parse_start_transcription(data, task_id)
+                        task_id = message_task_id or task_id
+                        session = _AudioSession(
+                            task_id=task_id,
+                            params=params,
+                            audio_cache={},
+                            audio_buffer=np.array([], dtype=np.float32),
                         )
-                    except WebSocketDisconnect:
-                        # 客户端断开，向外层抛出
-                        logger.debug(f"[{task_id}] 处理消息时检测到客户端断开")
-                        raise
-                    except Exception as e:
-                        logger.error(f"[{task_id}] 处理消息异常: {e}")
-                        await self._send_task_failed(websocket, task_id, str(e))
-                        break
+                        max_samples = (
+                            self._get_sample_rate(params) * MAX_PENDING_AUDIO_SECONDS
+                        )
+                        audio_queue = _BoundedAudioQueue(max_samples)
+                        audio_worker = asyncio.create_task(
+                            self._run_audio_worker(websocket, audio_queue, session),
+                            name=f"funasr-audio-{task_id}",
+                        )
+                        await self._send_transcription_started(
+                            websocket, task_id, session_id
+                        )
+                        state = ConnectionState.STARTED
+                        continue
 
-                elif "bytes" in message:
-                    if state == ConnectionState.STARTED:
-                        audio_bytes = message["bytes"]
-
-                        if not transcription_params:
+                    if message_name == AliyunASRMessageName.STOP_TRANSCRIPTION:
+                        if (
+                            state != ConnectionState.STARTED
+                            or session is None
+                            or audio_queue is None
+                        ):
                             await self._send_task_failed(
-                                websocket, task_id, "StartTranscription not received"
+                                websocket, task_id, "Connection not started"
+                            )
+                            continue
+                        if message_task_id != task_id:
+                            await self._send_task_failed(
+                                websocket, task_id, "Task ID not match"
                             )
                             continue
 
-                        try:
-                            # 将接收到的音频添加到缓冲区
-                            audio_format = transcription_params.get("format", "pcm")
-                            sample_rate = transcription_params.get("sample_rate", 16000)
-                            incoming_audio = self._convert_audio_bytes_to_array(
-                                audio_bytes, audio_format, sample_rate, task_id
-                            )
+                        await audio_queue.finish()
+                        assert audio_worker is not None
+                        await audio_worker
+                        await self._finish_session(websocket, session)
+                        await self._send_transcription_completed(websocket, task_id)
+                        logger.info("[%s] Recognition completed", task_id)
+                        return
 
-                            audio_buffer = np.concatenate([audio_buffer, incoming_audio])
-                            if len(audio_buffer) > max_buffer_size:
-                                logger.warning(
-                                    f"[{task_id}] WebSocket音频缓冲区超过限制，保留最近 {max_buffer_size} samples"
-                                )
-                                audio_buffer = audio_buffer[-max_buffer_size:]
+                    await self._send_task_failed(
+                        websocket, task_id, f"Invalid message name: {message_name}"
+                    )
+                    continue
 
-                            standard_chunk_sizes = [3840, 9600]
-                            selected_chunk_size = None
-                            for chunk_size in sorted(standard_chunk_sizes, reverse=True):
-                                if len(audio_buffer) >= chunk_size:
-                                    selected_chunk_size = chunk_size
-                                    break
+                if "bytes" not in message:
+                    continue
+                if (
+                    state != ConnectionState.STARTED
+                    or session is None
+                    or audio_queue is None
+                ):
+                    await self._send_task_failed(
+                        websocket, task_id, "Connection not started"
+                    )
+                    continue
+                if audio_worker is not None and audio_worker.done():
+                    await audio_worker
 
-                            if selected_chunk_size is None:
-                                continue
+                audio_format = session.params.get("format", "pcm")
+                sample_rate = self._get_sample_rate(session.params)
+                incoming_audio = self._convert_audio_bytes_to_array(
+                    message["bytes"], audio_format, sample_rate, task_id
+                )
+                blocked_seconds = await audio_queue.put(incoming_audio)
+                if blocked_seconds > 0:
+                    logger.warning(
+                        "[%s] Applied audio ingress backpressure for %.3fs",
+                        task_id,
+                        blocked_seconds,
+                    )
 
-                            while len(audio_buffer) >= selected_chunk_size:
-                                chunk_start_time = audio_time
+        except WebSocketDisconnect as exc:
+            logger.warning(
+                "[%s] WebSocket disconnected: code=%s reason=%s",
+                task_id,
+                exc.code,
+                exc.reason or "-",
+            )
+        except Exception as exc:
+            logger.exception("[%s] WebSocket ASR connection failed", task_id)
+            with suppress(Exception):
+                await self._send_task_failed(websocket, task_id, str(exc))
+            with suppress(Exception):
+                await websocket.close(code=1011, reason="Audio processing failed")
+        finally:
+            if audio_queue is not None:
+                await audio_queue.abort()
+            if audio_worker is not None and not audio_worker.done():
+                audio_worker.cancel()
+                with suppress(asyncio.CancelledError):
+                    await audio_worker
 
-                                audio_chunk = audio_buffer[:selected_chunk_size]
-                                audio_buffer = audio_buffer[selected_chunk_size:]
+    @staticmethod
+    async def _receive_message_or_worker_failure(
+        websocket, audio_worker: Optional[asyncio.Task[None]]
+    ) -> dict[str, Any]:
+        if audio_worker is None:
+            return await websocket.receive()
 
-                                effective_rms_threshold = settings.ASR_NEARFIELD_RMS_THRESHOLD
-                                if sentence_active:
-                                    effective_rms_threshold = settings.ASR_NEARFIELD_RMS_THRESHOLD * 0.6
+        receive_task = asyncio.create_task(websocket.receive())
+        done, _ = await asyncio.wait(
+            {receive_task, audio_worker}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if audio_worker in done:
+            if not receive_task.done():
+                receive_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await receive_task
+            await audio_worker
+            raise RuntimeError("Audio worker stopped unexpectedly")
 
-                                is_nearfield, filter_metrics = is_nearfield_voice(
-                                    audio_chunk,
-                                    sample_rate=sample_rate,
-                                    rms_threshold=effective_rms_threshold,
-                                    enable_filter=settings.ASR_ENABLE_NEARFIELD_FILTER,
-                                )
+        return receive_task.result()
 
-                                is_sentence_end = False
-                                if not is_nearfield:
-                                    if logger.isEnabledFor(logging.DEBUG):
-                                        logger.debug(
-                                            f"[{task_id}] 远场声音已过滤 - "
-                                            f"RMS: {filter_metrics['rms_energy']:.6f} (阈值: {effective_rms_threshold:.6f})"
-                                        )
+    async def _run_audio_worker(
+        self,
+        websocket,
+        audio_queue: _BoundedAudioQueue,
+        session: _AudioSession,
+    ) -> None:
+        try:
+            while (audio := await audio_queue.get()) is not None:
+                await self._process_audio_samples(websocket, session, audio)
+        except Exception:
+            await audio_queue.abort()
+            raise
 
-                                    chunk_duration_ms = int(len(audio_chunk) / sample_rate * 1000)
-                                    audio_time += chunk_duration_ms
+    async def _process_audio_samples(
+        self,
+        websocket,
+        session: _AudioSession,
+        incoming_audio: np.ndarray,
+    ) -> None:
+        session.audio_buffer = np.concatenate([session.audio_buffer, incoming_audio])
+        sample_rate = self._get_sample_rate(session.params)
+        selected_chunk_size = 9600 if len(session.audio_buffer) >= 9600 else 3840
 
-                                    if sentence_active:
-                                        result_text = ""
-                                        result_text_raw = ""
-                                        is_silence_frame = False
-                                    else:
-                                        continue
+        while len(session.audio_buffer) >= selected_chunk_size:
+            chunk_start_time = session.audio_time
+            audio_chunk = session.audio_buffer[:selected_chunk_size]
+            session.audio_buffer = session.audio_buffer[selected_chunk_size:]
 
-                                else:
-                                    if logger.isEnabledFor(logging.DEBUG) and filter_metrics.get('enabled', True):
-                                        logger.debug(
-                                            f"[{task_id}] 近场声音检测通过 - "
-                                            f"RMS: {filter_metrics['rms_energy']:.6f} (阈值: {effective_rms_threshold:.6f})"
-                                        )
+            threshold = settings.ASR_NEARFIELD_RMS_THRESHOLD
+            if session.sentence_active:
+                threshold *= 0.6
+            is_nearfield, filter_metrics = is_nearfield_voice(
+                audio_chunk,
+                sample_rate=sample_rate,
+                rms_threshold=threshold,
+                enable_filter=settings.ASR_ENABLE_NEARFIELD_FILTER,
+            )
 
-                                    (
-                                        result_text,
-                                        result_text_raw,
-                                        is_silence_frame,
-                                        audio_cache,
-                                        audio_time,
-                                    ) = await self._process_audio_chunk(
-                                        audio_chunk,
-                                        audio_cache,
-                                        transcription_params,
-                                        audio_time,
-                                        task_id,
-                                        is_final=False,
-                                    )
-
-                                max_empty_count = max(
-                                    3,
-                                    (
-                                        transcription_params.get(
-                                            "max_sentence_silence", 800
-                                        )
-                                        * 2
-                                    )
-                                    // 600,
-                                )
-
-                                if not result_text:
-                                    empty_result_count += 1
-                                    if (
-                                        sentence_active
-                                        and empty_result_count >= max_empty_count
-                                    ):
-                                        is_sentence_end = True
-                                        logger.debug(
-                                            f"[{task_id}] 连续空结果，判断句子结束"
-                                        )
-                                else:
-                                    empty_result_count = 0
-
-                                # 检测到静音帧且当前有正在识别的句子，触发SentenceEnd
-                                if (
-                                    is_silence_frame
-                                    and sentence_active
-                                    and sentence_texts_raw
-                                ):
-                                    is_sentence_end = True
-                                    logger.debug(f"[{task_id}] 检测到静音帧，判断句子结束")
-
-                                if is_sentence_end and sentence_active:
-                                    (
-                                        _,
-                                        flush_result_text_raw,
-                                        _,
-                                        audio_cache,
-                                        audio_time,
-                                    ) = await self._process_audio_chunk(
-                                        np.array([], dtype=np.float32),
-                                        audio_cache,
-                                        transcription_params,
-                                        audio_time,
-                                        task_id,
-                                        is_final=True,
-                                    )
-
-                                    if flush_result_text_raw:
-                                        if (
-                                            not sentence_texts_raw
-                                            or flush_result_text_raw
-                                            != sentence_texts_raw[-1]
-                                        ):
-                                            sentence_texts_raw.append(flush_result_text_raw)
-
-                                    sentence_index += 1
-                                    sentence_duration = audio_time - sentence_start_time
-                                    full_sentence_text = "".join(sentence_texts_raw)
-
-                                    if transcription_params.get(
-                                        "enable_punctuation_prediction", True
-                                    ):
-                                        full_sentence_text = (
-                                            await self._apply_final_punctuation_to_sentence(
-                                                full_sentence_text, task_id
-                                            )
-                                        )
-
-                                    logger.debug(
-                                        f"[{task_id}] 句子结束 #{sentence_index}: '{full_sentence_text}' "
-                                        f"({sentence_duration}ms)"
-                                    )
-                                    await self._send_sentence_end(
-                                        websocket,
-                                        task_id,
-                                        sentence_index,
-                                        audio_time,
-                                        full_sentence_text,
-                                        sentence_start_time,
-                                        enable_itn=transcription_params.get(
-                                            "enable_inverse_text_normalization", True
-                                        ),
-                                    )
-                                    sentence_active = False
-                                    sentence_start_time = 0
-                                    last_sentence_text = ""
-                                    sentence_texts = []
-                                    sentence_texts_raw = []
-                                    empty_result_count = 0
-                                    audio_cache = {}
-                                elif result_text:
-                                    if result_text != last_sentence_text:
-                                        last_sentence_text = result_text
-                                        if (
-                                            not sentence_texts
-                                            or result_text != sentence_texts[-1]
-                                        ):
-                                            sentence_texts.append(result_text)
-                                        if (
-                                            not sentence_texts_raw
-                                            or result_text_raw != sentence_texts_raw[-1]
-                                        ):
-                                            sentence_texts_raw.append(result_text_raw)
-
-                                        if not sentence_active:
-                                            sentence_active = True
-                                            sentence_start_time = chunk_start_time
-                                            sentence_texts = [result_text]
-                                            sentence_texts_raw = [result_text_raw]
-                                            empty_result_count = 0
-                                            logger.debug(
-                                                f"[{task_id}] 句子开始 #{sentence_index + 1}"
-                                            )
-                                            await self._send_sentence_begin(
-                                                websocket,
-                                                task_id,
-                                                sentence_index + 1,
-                                                sentence_start_time,
-                                            )
-
-                                        if transcription_params.get(
-                                            "enable_intermediate_result", True
-                                        ):
-                                            # 发送当前句子的累计完整文本（去重拼接）
-                                            accumulated_text = "".join(sentence_texts)
-                                            await self._send_transcription_result_changed(
-                                                websocket,
-                                                task_id,
-                                                sentence_index + 1,
-                                                audio_time,
-                                                accumulated_text,
-                                            )
-
-                        except WebSocketDisconnect:
-                            # 客户端断开，向外层抛出
-                            logger.debug(f"[{task_id}] 音频处理时检测到客户端断开")
-                            raise
-                        except Exception as e:
-                            logger.error(f"[{task_id}] 音频处理异常: {e}")
-                            await self._send_task_failed(
-                                websocket, task_id, f"Audio processing failed: {str(e)}"
-                            )
-                    else:
-                        await self._send_task_failed(
-                            websocket, task_id, "Connection not started"
-                        )
-
-        except WebSocketDisconnect:
-            logger.warning(f"[{task_id}] 客户端主动断开WebSocket连接")
-        except Exception as e:
-            # 检查是否是WebSocket连接相关的异常
-            error_msg = str(e)
-            if (
-                "Cannot call \"receive\" once a disconnect message has been received" in error_msg
-                or "WebSocket is not connected" in error_msg
-                or "Need to call \"accept\" first" in error_msg
-            ):
-                logger.warning(f"[{task_id}] WebSocket连接已断开: {e}")
+            is_sentence_end = False
+            if not is_nearfield:
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "[%s] Filtered far-field audio: rms=%.6f threshold=%.6f",
+                        session.task_id,
+                        filter_metrics["rms_energy"],
+                        threshold,
+                    )
+                session.audio_time += int(len(audio_chunk) / sample_rate * 1000)
+                if not session.sentence_active:
+                    continue
+                result_text = ""
+                result_text_raw = ""
+                is_silence_frame = False
             else:
-                logger.error(f"[{task_id}] WebSocket ASR连接处理异常: {e}")
-                with suppress(Exception):
-                    await self._send_task_failed(websocket, task_id, str(e))
+                (
+                    result_text,
+                    result_text_raw,
+                    is_silence_frame,
+                    session.audio_cache,
+                    session.audio_time,
+                ) = await self._process_audio_chunk(
+                    audio_chunk,
+                    session.audio_cache,
+                    session.params,
+                    session.audio_time,
+                    session.task_id,
+                )
+
+            max_empty_count = max(
+                3, (session.params.get("max_sentence_silence", 800) * 2) // 600
+            )
+            if not result_text:
+                session.empty_result_count += 1
+                is_sentence_end = (
+                    session.sentence_active
+                    and session.empty_result_count >= max_empty_count
+                )
+            else:
+                session.empty_result_count = 0
+
+            if (
+                is_silence_frame
+                and session.sentence_active
+                and session.sentence_texts_raw
+            ):
+                is_sentence_end = True
+
+            if is_sentence_end and session.sentence_active:
+                await self._complete_sentence(websocket, session)
+                continue
+
+            if result_text and result_text != session.last_sentence_text:
+                session.last_sentence_text = result_text
+                if (
+                    not session.sentence_texts
+                    or result_text != session.sentence_texts[-1]
+                ):
+                    session.sentence_texts.append(result_text)
+                if (
+                    not session.sentence_texts_raw
+                    or result_text_raw != session.sentence_texts_raw[-1]
+                ):
+                    session.sentence_texts_raw.append(result_text_raw)
+
+                if not session.sentence_active:
+                    session.sentence_active = True
+                    session.sentence_start_time = chunk_start_time
+                    session.sentence_texts = [result_text]
+                    session.sentence_texts_raw = [result_text_raw]
+                    session.empty_result_count = 0
+                    await self._send_sentence_begin(
+                        websocket,
+                        session.task_id,
+                        session.sentence_index + 1,
+                        session.sentence_start_time,
+                    )
+
+                if session.params.get("enable_intermediate_result", True):
+                    await self._send_transcription_result_changed(
+                        websocket,
+                        session.task_id,
+                        session.sentence_index + 1,
+                        session.audio_time,
+                        "".join(session.sentence_texts),
+                    )
+
+    async def _complete_sentence(self, websocket, session: _AudioSession) -> None:
+        (
+            _,
+            flush_result_text_raw,
+            _,
+            session.audio_cache,
+            session.audio_time,
+        ) = await self._process_audio_chunk(
+            np.array([], dtype=np.float32),
+            session.audio_cache,
+            session.params,
+            session.audio_time,
+            session.task_id,
+            is_final=True,
+        )
+        if flush_result_text_raw and (
+            not session.sentence_texts_raw
+            or flush_result_text_raw != session.sentence_texts_raw[-1]
+        ):
+            session.sentence_texts_raw.append(flush_result_text_raw)
+
+        session.sentence_index += 1
+        text = "".join(session.sentence_texts_raw)
+        if session.params.get("enable_punctuation_prediction", True):
+            text = await self._apply_final_punctuation_to_sentence(
+                text, session.task_id
+            )
+        await self._send_sentence_end(
+            websocket,
+            session.task_id,
+            session.sentence_index,
+            session.audio_time,
+            text,
+            session.sentence_start_time,
+            enable_itn=session.params.get("enable_inverse_text_normalization", True),
+        )
+        session.sentence_active = False
+        session.sentence_start_time = 0
+        session.last_sentence_text = ""
+        session.sentence_texts = []
+        session.sentence_texts_raw = []
+        session.empty_result_count = 0
+        session.audio_cache = {}
+
+    async def _finish_session(self, websocket, session: _AudioSession) -> None:
+        if session.sentence_active and session.sentence_texts_raw:
+            await self._complete_sentence(websocket, session)
 
     def _parse_start_transcription(self, data: dict, task_id: str) -> dict:
         """解析StartTranscription消息参数"""
@@ -488,6 +529,23 @@ class AliyunWebSocketASRService:
         }
         logger.info(f"[{task_id}] StartTranscription参数解析成功: {params}")
         return params
+
+    @staticmethod
+    def _get_sample_rate(params: dict[str, Any]) -> int:
+        sample_rate_value = params.get("sample_rate", 16000)
+        if isinstance(sample_rate_value, (list, tuple)):
+            sample_rate_value = sample_rate_value[0] if sample_rate_value else 16000
+        if isinstance(sample_rate_value, str):
+            sample_rate_value = sample_rate_value.strip()
+            if not sample_rate_value.isdigit():
+                raise ValueError(f"Invalid sample rate: {sample_rate_value}")
+        try:
+            sample_rate = int(sample_rate_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid sample rate: {sample_rate_value}") from exc
+        if sample_rate <= 0:
+            raise ValueError(f"Invalid sample rate: {sample_rate}")
+        return sample_rate
 
     def _is_silence_frame(
         self, audio_array: np.ndarray, threshold: float = 0.001
@@ -528,19 +586,7 @@ class AliyunWebSocketASRService:
         try:
             asr_engine = self._ensure_asr_engine()
 
-            sample_rate_value = params.get("sample_rate", 16000)
-            if isinstance(sample_rate_value, (list, tuple)):
-                sample_rate_value = sample_rate_value[0] if sample_rate_value else 16000
-            if isinstance(sample_rate_value, str):
-                sample_rate_value = sample_rate_value.strip()
-                if sample_rate_value.isdigit():
-                    sample_rate_value = int(sample_rate_value)
-                else:
-                    raise Exception(f"无效的采样率参数: {sample_rate_value}")
-            try:
-                sample_rate = int(sample_rate_value)
-            except (TypeError, ValueError):
-                raise Exception(f"无效的采样率类型: {sample_rate_value}")
+            sample_rate = self._get_sample_rate(params)
 
             audio_array = np.asarray(audio_array, dtype=np.float32)
 
@@ -624,6 +670,7 @@ class AliyunWebSocketASRService:
                             asr_engine.device
                         )
                         if punc_realtime_model:
+
                             def _apply_realtime_punc():
                                 with get_punc_realtime_inference_lock():
                                     return punc_realtime_model.generate(
@@ -651,9 +698,9 @@ class AliyunWebSocketASRService:
                 new_audio_time,
             )
 
-        except Exception as e:
-            logger.exception(f"[{task_id}] 音频块处理失败: {e}")
-            raise e
+        except Exception:
+            logger.exception("[%s] Audio chunk processing failed", task_id)
+            raise
 
     async def _apply_final_punctuation_to_sentence(
         self, text: str, task_id: str
@@ -671,6 +718,7 @@ class AliyunWebSocketASRService:
                 return text
 
             logger.debug(f"[{task_id}] 应用标点恢复: '{text}'")
+
             def _apply_final_punc():
                 with get_punc_inference_lock():
                     return punc_model.generate(input=text, cache={})
@@ -704,14 +752,15 @@ class AliyunWebSocketASRService:
         """
         if audio_format == "pcm":
             audio_array = (
-                np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
-                / 32768.0
+                np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
             )
         elif audio_format == "wav":
             audio_io = io.BytesIO(audio_bytes)
             audio_array, sr = sf.read(audio_io)
             if sr != sample_rate:
-                logger.warning(f"[{task_id}] WAV采样率 {sr} 与配置 {sample_rate} 不一致")
+                logger.warning(
+                    f"[{task_id}] WAV采样率 {sr} 与配置 {sample_rate} 不一致"
+                )
         else:
             raise Exception(f"暂不支持的音频格式: {audio_format}")
 
@@ -745,9 +794,11 @@ class AliyunWebSocketASRService:
     async def _send_event(self, websocket, task_id: str, response: dict) -> None:
         try:
             await websocket.send_text(json.dumps(response, ensure_ascii=False))
-        except Exception as e:
-            logger.debug(f"[{task_id}] 发送WebSocket事件失败，客户端可能已断开: {e}")
-            raise WebSocketDisconnect()
+        except Exception:
+            logger.warning(
+                "[%s] Failed to send WebSocket event", task_id, exc_info=True
+            )
+            raise
 
     async def _send_transcription_started(
         self, websocket, task_id: str, session_id: str

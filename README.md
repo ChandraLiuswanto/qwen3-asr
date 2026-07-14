@@ -366,6 +366,8 @@ Automatic long audio segmentation:
 - ✅ Sentence-level timestamps
 - ❌ **Word-level timestamps** (not implemented on the FunASR realtime path)
 - ❌ **Confidence scores** (not implemented)
+- Audio ingress is bounded to 10 seconds and applies WebSocket backpressure instead of dropping audio. Send incrementally and continue reading recognition events.
+- This path uses Paraformer, while offline endpoints use Qwen3-ASR. Compare latency within the same path, not their total throughput.
 
 **Qwen3-ASR Streaming** (using `/ws/v1/asr/qwen`):
 - ✅ Multi-language real-time recognition
