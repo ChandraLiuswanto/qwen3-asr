@@ -59,12 +59,15 @@ class ConnectionContext:
     params: Dict[str, Any] = field(default_factory=dict)
     engine_lease: Optional[RuntimeEngineLease] = None
     engine: Optional[Qwen3ASREngine] = None
-    audio_buffer: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
+    audio_buffer: np.ndarray = field(
+        default_factory=lambda: np.array([], dtype=np.float32)
+    )
     streaming_state: Optional[Qwen3StreamingState] = None
     silence_samples: int = 0
     total_samples: int = 0
     confirmed_segments: List[Dict[str, Any]] = field(default_factory=list)
     segment_index: int = 0
+    last_partial_text: str = ""
 
     SILENCE_THRESHOLD = 32000
     MAX_BUFFER = 960000
@@ -145,8 +148,9 @@ class Qwen3ASRService:
                     }
                 )
 
-                confirmed = "\n".join([segment["text"] for segment in ctx.confirmed_segments])
-                full_text = confirmed + "\n" + segment_text if confirmed else segment_text
+                full_text = "\n".join(
+                    segment["text"] for segment in ctx.confirmed_segments
+                )
 
                 await websocket.send_json(
                     {
@@ -166,13 +170,16 @@ class Qwen3ASRService:
                 )
 
                 ctx.segment_index += 1
-                logger.info("[%s] Segment truncated, new segment %s", task_id, ctx.segment_index)
+                logger.info(
+                    "[%s] Segment truncated, new segment %s", task_id, ctx.segment_index
+                )
             else:
                 logger.debug("[%s] Short segment filtered: %r", task_id, segment_text)
 
             ctx.audio_buffer = np.array([], dtype=np.float32)
             ctx.silence_samples = 0
             ctx.total_samples = 0
+            ctx.last_partial_text = ""
             ctx.streaming_state = engine.init_streaming_state(
                 context=ctx.params.get("context", ""),
                 language=ctx.params.get("language"),
@@ -202,7 +209,9 @@ class Qwen3ASRService:
         code: str = "DEFAULT_SERVER_ERROR",
     ) -> None:
         try:
-            error = create_error_response(error_code=code, message=message, task_id=task_id)
+            error = create_error_response(
+                error_code=code, message=message, task_id=task_id
+            )
             error["type"] = "error"
             await websocket.send_json(error)
         except Exception:
@@ -224,7 +233,9 @@ class Qwen3ASRService:
 
                     if msg_type == "start":
                         if ctx.state != ConnectionState.READY:
-                            await self._send_error(websocket, "识别已在进行中", task_id, "INVALID_STATE")
+                            await self._send_error(
+                                websocket, "识别已在进行中", task_id, "INVALID_STATE"
+                            )
                             continue
 
                         payload = data.get("payload", {})
@@ -262,7 +273,10 @@ class Qwen3ASRService:
                         logger.info("[%s] Recognition started: %s", task_id, ctx.params)
 
                     elif msg_type == "stop":
-                        if ctx.state in (ConnectionState.STARTED, ConnectionState.STREAMING):
+                        if ctx.state in (
+                            ConnectionState.STARTED,
+                            ConnectionState.STREAMING,
+                        ):
                             await self._stop(websocket, ctx, task_id)
                         break
 
@@ -275,8 +289,13 @@ class Qwen3ASRService:
                         )
 
                 elif "bytes" in message:
-                    if ctx.state not in (ConnectionState.STARTED, ConnectionState.STREAMING):
-                        await self._send_error(websocket, "请先发送 start", task_id, "INVALID_STATE")
+                    if ctx.state not in (
+                        ConnectionState.STARTED,
+                        ConnectionState.STREAMING,
+                    ):
+                        await self._send_error(
+                            websocket, "请先发送 start", task_id, "INVALID_STATE"
+                        )
                         continue
 
                     audio = _convert_audio(
@@ -327,16 +346,18 @@ class Qwen3ASRService:
                         )
                         full = confirmed + "\n" + current if confirmed else current
 
-                        results.append(
-                            {
-                                "text": full,
-                                "current_segment_text": current,
-                                "language": ctx.streaming_state.last_language,
-                                "chunk_id": ctx.streaming_state.chunk_count,
-                                "is_partial": True,
-                                "segment_index": ctx.segment_index,
-                            }
-                        )
+                        if full != ctx.last_partial_text:
+                            ctx.last_partial_text = full
+                            results.append(
+                                {
+                                    "text": full,
+                                    "current_segment_text": current,
+                                    "language": ctx.streaming_state.last_language,
+                                    "chunk_id": ctx.streaming_state.chunk_count,
+                                    "is_partial": True,
+                                    "segment_index": ctx.segment_index,
+                                }
+                            )
 
                     if results:
                         await websocket.send_json(
@@ -356,7 +377,9 @@ class Qwen3ASRService:
             logger.error("[%s] Connection error: %s", task_id, exc)
             await self._send_error(websocket, str(exc), task_id)
         finally:
-            stream_handle = getattr(getattr(ctx, "streaming_state", None), "internal_state", None)
+            stream_handle = getattr(
+                getattr(ctx, "streaming_state", None), "internal_state", None
+            )
             close_stream = getattr(stream_handle, "close", None)
             if callable(close_stream):
                 close_stream()
@@ -386,7 +409,9 @@ class Qwen3ASRService:
                 ctx.streaming_state,
             )
 
-            final = self._normalize_output_text(ctx.streaming_state.last_text or "", ctx)
+            final = self._normalize_output_text(
+                ctx.streaming_state.last_text or "", ctx
+            )
             if final.strip():
                 ctx.confirmed_segments.append(
                     {
@@ -419,7 +444,11 @@ class Qwen3ASRService:
                 }
             )
 
-            logger.info("[%s] Recognition completed, segments=%s", task_id, len(ctx.confirmed_segments))
+            logger.info(
+                "[%s] Recognition completed, segments=%s",
+                task_id,
+                len(ctx.confirmed_segments),
+            )
 
         except Exception as exc:
             logger.error("[%s] Stop failed: %s", task_id, exc)
