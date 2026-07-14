@@ -227,14 +227,11 @@ def _build_huggingface_spec(
     min_total_size_bytes: int,
     alternative_required_patterns: tuple[tuple[str, ...], ...] = (),
 ) -> ModelIntegritySpec:
-    org, model = model_id.split("/", 1)
+    from app.infrastructure import get_huggingface_model_cache_dir
+
     return ModelIntegritySpec(
         description=description,
-        path=Path.home()
-        / ".cache"
-        / "huggingface"
-        / "hub"
-        / f"models--{org}--{model}",
+        path=get_huggingface_model_cache_dir(model_id),
         required_patterns=required_patterns,
         alternative_required_patterns=alternative_required_patterns,
         min_total_size_bytes=min_total_size_bytes,
@@ -270,7 +267,7 @@ def _build_required_model_integrity_specs() -> list[ModelIntegritySpec]:
     specs: list[ModelIntegritySpec] = []
 
     for asset in get_runtime_required_modelscope_assets(
-        include_realtime_punc=settings.ASR_ENABLE_REALTIME_PUNC,
+        include_realtime_punc=True,
     ):
         specs.append(
             _build_modelscope_spec(
@@ -383,22 +380,24 @@ def verify_required_models_integrity(use_logger: bool = True) -> dict[str, Any]:
         "results": results,
         "invalid_models": invalid,
     }
+
+
 def preload_models() -> dict[str, Any]:
     """
-    预加载所有需要的模型（根据 ENABLE_* 配置过滤）
+    Preload all required models after applying runtime filters.
 
     Returns:
-        dict: 包含加载状态的字典
+        dict: Model loading status.
     """
-    # 修复 CAM++ 配置文件（用于离线环境）
+    # Fix CAM++ config files for offline environments.
     try:
         from .download_models import fix_camplusplus_config
         fix_camplusplus_config()
     except Exception:
-        pass  # 修复失败不影响启动
+        pass  # Config repair failures should not block startup.
 
     result: dict[str, Any] = {
-        "asr_models": {},  # 所有ASR模型加载状态
+        "asr_models": {},  # ASR model loading status.
         "vad_model": {"loaded": False, "error": None},
         "punc_model": {"loaded": False, "error": None},
         "punc_realtime_model": {"loaded": False, "error": None},
@@ -408,11 +407,11 @@ def preload_models() -> dict[str, Any]:
     from ..core.config import settings
     from ..core.device import detect_device
 
-    # 初始化变量，避免未绑定错误
+    # Initialize variables before the guarded import block.
     asr_device = detect_device(settings.DEVICE)
     model_manager = None
 
-    # 1. 预加载所有配置的ASR模型（根据 ENABLE_* 配置过滤）
+    # 1. Preload configured ASR models after runtime filtering.
     model_ids: list[str] = []
     model_manager = None
 
@@ -424,7 +423,7 @@ def preload_models() -> dict[str, Any]:
         model_manager = get_model_manager()
         runtime_router = get_runtime_router()
 
-        # 获取所有模型配置
+        # Get all declared model configs.
         all_models = model_manager.list_declared_entries()
         model_ids = [m["id"] for m in all_models]
 
@@ -438,14 +437,12 @@ def preload_models() -> dict[str, Any]:
         models_to_load = []
         runtime_router = None
 
-    # 辅助函数：检查是否要加载 paraformer
+    # Check whether paraformer-only support models should be loaded.
     paraformer_enabled = "paraformer-large" in models_to_load
 
     total_steps = len(models_to_load) + 2
     if paraformer_enabled:
-        total_steps += 1
-        if settings.ASR_ENABLE_REALTIME_PUNC:
-            total_steps += 1
+        total_steps += 2
 
     logger.info(
         "开始预加载模型: declared=%s runtime=%s models=%s",
@@ -468,7 +465,7 @@ def preload_models() -> dict[str, Any]:
                 logger.error("ASR模型预加载失败: %s, error=%s", model_id, e)
             progress.advance(f"已完成 ASR 模型 {model_id}")
 
-        # 2. 预加载语音活动检测模型(VAD)
+        # 2. Preload the voice activity detection model (VAD).
         progress.update("加载语音活动检测模型(VAD)")
         try:
             from ..services.asr.engines import get_global_vad_model
@@ -483,7 +480,7 @@ def preload_models() -> dict[str, Any]:
             logger.error("语音活动检测模型(VAD)加载失败: %s", e)
         progress.advance("已完成语音活动检测模型(VAD)")
 
-        # 3. 预加载标点符号模型 (离线版)
+        # 3. Preload the offline punctuation model.
         if paraformer_enabled:
             progress.update("加载标点符号模型(离线)")
             try:
@@ -499,8 +496,8 @@ def preload_models() -> dict[str, Any]:
                 logger.error("标点符号模型(离线)加载失败: %s", e)
             progress.advance("已完成标点符号模型(离线)")
 
-        # 4. 预加载实时标点符号模型 (如果启用)
-        if paraformer_enabled and settings.ASR_ENABLE_REALTIME_PUNC:
+        # 4. Preload the realtime punctuation model for Paraformer streaming.
+        if paraformer_enabled:
             progress.update("加载标点符号模型(实时)")
             try:
                 from ..services.asr.engines import get_global_punc_realtime_model
@@ -515,7 +512,7 @@ def preload_models() -> dict[str, Any]:
                 logger.error("实时标点符号模型加载失败: %s", e)
             progress.advance("已完成标点符号模型(实时)")
 
-        # 5. 预加载说话人分离模型 (CAM++) - 必需模型，始终加载
+        # 5. Preload the required speaker diarization model (CAM++).
         progress.update("加载说话人分离模型(CAM++)")
         try:
             from ..utils.speaker_diarizer import get_global_diarization_pipeline

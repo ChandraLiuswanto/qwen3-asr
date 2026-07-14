@@ -1,8 +1,20 @@
 # -*- coding: utf-8 -*-
-"""
-基础设施层 - 提供底层通用功能
-"""
+"""Infrastructure helpers."""
 
-from .model_utils import resolve_model_path
+from .model_utils import (
+    find_huggingface_snapshot_dir,
+    get_huggingface_cache_root,
+    get_huggingface_model_cache_dir,
+    is_huggingface_offline,
+    resolve_huggingface_snapshot_dir,
+    resolve_model_path,
+)
 
-__all__ = ["resolve_model_path"]
+__all__ = [
+    "find_huggingface_snapshot_dir",
+    "get_huggingface_cache_root",
+    "get_huggingface_model_cache_dir",
+    "is_huggingface_offline",
+    "resolve_huggingface_snapshot_dir",
+    "resolve_model_path",
+]

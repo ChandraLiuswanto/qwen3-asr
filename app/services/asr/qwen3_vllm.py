@@ -14,6 +14,7 @@ from typing import Any, Optional
 import librosa
 import numpy as np
 
+from app.infrastructure import resolve_huggingface_snapshot_dir
 from app.utils.text_processing import normalize_asr_text
 
 from .engines import ASRRawResult, ASRSegmentResult, WordToken
@@ -171,15 +172,23 @@ class Qwen3VLLMBackend:
                 "Install it with: pip install 'vllm[audio]==0.19.0'"
             ) from exc
 
+        local_model_path = str(resolve_huggingface_snapshot_dir(model_path))
+        local_forced_aligner_path = (
+            str(resolve_huggingface_snapshot_dir(forced_aligner_path))
+            if forced_aligner_path
+            else None
+        )
+
         self._llm_cls = getattr(vllm_module, "LLM")
         self._sampling_params_cls = getattr(vllm_module, "SamplingParams")
         self._tokenizer = getattr(transformers_module, "AutoTokenizer").from_pretrained(
-            model_path,
+            local_model_path,
             trust_remote_code=True,
+            local_files_only=True,
         )
 
         llm_kwargs: dict[str, Any] = {
-            "model": model_path,
+            "model": local_model_path,
             "gpu_memory_utilization": gpu_memory_utilization,
         }
         if max_model_len is not None:
@@ -192,7 +201,7 @@ class Qwen3VLLMBackend:
         )
         self._max_inference_batch_size = max_inference_batch_size
         self._gpu_memory_utilization = gpu_memory_utilization
-        self._forced_aligner_path = forced_aligner_path
+        self._forced_aligner_path = local_forced_aligner_path
         self._forced_aligner: Any | None = None
         self._timestamp_token_id: int | None = None
         self._timestamp_segment_time: float | None = None

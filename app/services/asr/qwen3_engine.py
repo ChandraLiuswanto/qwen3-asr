@@ -219,21 +219,8 @@ class Qwen3ASREngine(BaseASREngine):
 
         return self._rust_batch_runtimes[:worker_count]
 
-    def _get_rust_stage_concurrency(self, configured: int, segment_count: int) -> int:
-        target = configured if configured > 0 else settings.QWEN_RUST_CPU_WORKERS
-        return max(1, min(target, segment_count))
-
-    def _get_rust_asr_concurrency(self, segment_count: int) -> int:
-        return self._get_rust_stage_concurrency(
-            settings.QWEN_RUST_ASR_CONCURRENCY,
-            segment_count,
-        )
-
-    def _get_rust_align_concurrency(self, segment_count: int) -> int:
-        return self._get_rust_stage_concurrency(
-            settings.QWEN_RUST_ALIGN_CONCURRENCY,
-            segment_count,
-        )
+    def _get_rust_stage_concurrency(self, segment_count: int) -> int:
+        return max(1, min(settings.QWEN_RUST_CPU_WORKERS, segment_count))
 
     def _rust_transcribe_text_segment(
         self,
@@ -279,7 +266,7 @@ class Qwen3ASREngine(BaseASREngine):
         if not valid_segments:
             return {}
 
-        worker_count = self._get_rust_asr_concurrency(len(valid_segments))
+        worker_count = self._get_rust_stage_concurrency(len(valid_segments))
         runtimes = self._get_rust_batch_runtimes(worker_count)
         output: dict[int, str] = {}
         for batch_start in range(0, len(valid_segments), worker_count):
@@ -313,7 +300,7 @@ class Qwen3ASREngine(BaseASREngine):
             return {}
 
         align_inputs = [(idx, seg, texts.get(idx, "")) for idx, seg in valid_segments if texts.get(idx, "").strip()]
-        worker_count = self._get_rust_align_concurrency(len(valid_segments))
+        worker_count = self._get_rust_stage_concurrency(len(valid_segments))
         runtimes = self._get_rust_batch_runtimes(worker_count)
         output: dict[int, list[WordToken]] = {}
 

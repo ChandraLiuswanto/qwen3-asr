@@ -11,9 +11,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Keep HuggingFace downloads enabled by default. Operators can still set
-# HF_HUB_LOCAL_FILES_ONLY=1 for strictly offline deployments.
-os.environ.setdefault("HF_HUB_LOCAL_FILES_ONLY", "0")
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("TQDM_DISABLE", "1")
@@ -25,6 +22,14 @@ os.environ.setdefault("DISABLE_TQDM", "1")
 # values back to "unset" before any HF/transformers imports happen.
 if not (os.getenv("HF_ENDPOINT") or "").strip():
     os.environ.pop("HF_ENDPOINT", None)
+
+
+def _is_truthy_env(value: str | None) -> bool:
+    return (value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+if _is_truthy_env(os.getenv("HF_HUB_OFFLINE")):
+    os.environ["HF_HUB_OFFLINE"] = "1"
 
 
 def _disable_third_party_progress_bars() -> None:

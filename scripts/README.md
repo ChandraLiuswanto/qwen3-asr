@@ -278,5 +278,4 @@ ASR_NEARFIELD_RMS_THRESHOLD=0.01
 
 ## 相关文档
 
-- [远场过滤功能文档](../docs/nearfield_filter.md)
 - [部署配置指南](../docs/deployment.md)

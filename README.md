@@ -30,9 +30,13 @@ Speech recognition API service centered on [Qwen3-ASR](https://github.com/QwenLM
 
 <img src="./demo/contact.jpg" alt="WeChat QR code" width="220">
 
-## Release 1.0.2
+## Release 1.0.3
 
-> `v1.0.2` adds the persistent voiceprint database backed by local sqlite-vec storage. `v1.0.0` introduced a large breaking refactor relative to the earlier `main` branch.
+> `v1.0.3` removes the voiceprint database and sqlite-vec dependency, unifies
+> offline deployment under `HF_HUB_OFFLINE`, and reduces the default deployment
+> configuration to the settings in `.env.example`.
+>
+> `v1.0.0` introduced a large breaking refactor relative to the earlier `main` branch.
 > If you are upgrading from `main`, read the release notes before reusing old deployment assumptions.
 >
 > Key breaking changes:
@@ -41,17 +45,12 @@ Speech recognition API service centered on [Qwen3-ASR](https://github.com/QwenLM
 > - `MLX` / Apple Silicon GPU path has been removed; `mps` is normalized to `cpu`
 > - macOS / Apple Silicon now defaults to `qwen3-asr-0.6b`; set `QWEN3_ASR_MODEL` to override it
 > - `ENABLED_MODELS` has been removed
+> - Voiceprint APIs and persistent speaker identity matching have been removed
 >
-> Voiceprint changes in `v1.0.2`:
-> - Voiceprint matching is enabled by deployment configuration, not by ASR request parameters
-> - Voiceprint vectors are stored in SQLite through `sqlite-vec`; PostgreSQL/pgvector is no longer used
-> - Docker Compose persists the voiceprint database under `./data`
-
 ## Features
 
 - **Hybrid Runtime Stack** - Uses auto-selected Qwen3-ASR for offline inference and Paraformer realtime for websocket streaming
 - **Speaker Diarization** - Automatic multi-speaker identification using CAM++ model
-- **Voiceprint Database** - Persistent speaker identity matching with sqlite-vec, using existing `speaker_id` fields
 - **OpenAI API Compatible** - Supports `/v1/audio/transcriptions` endpoint, works with OpenAI SDK
 - **Alibaba Cloud API Compatible** - Supports Alibaba Cloud Speech RESTful API and WebSocket streaming protocol
 - **WebSocket Streaming** - Real-time streaming speech recognition with low latency
@@ -88,10 +87,6 @@ Service URLs:
 - **API Endpoint**: `http://localhost:17003`
 - **API Docs**: `http://localhost:17003/docs`
 
-Optional built-in rate limit settings:
-- `NGINX_RATE_LIMIT_RPS` (global requests/sec, `0` = disabled)
-- `NGINX_RATE_LIMIT_BURST` (global burst, `0` = auto use RPS)
-
 **docker run (alternative):**
 
 ```bash
@@ -101,7 +96,6 @@ docker run -d --name qwen3-asr \
   -p 17003:8000 \
   -e CUDA_VISIBLE_DEVICES=0,1,2,3 \
   -e API_KEY=your_api_key \
-  -e VOICEPRINT_ENABLED=true \
   -v ./models/modelscope:/root/.cache/modelscope \
   -v ./models/huggingface:/root/.cache/huggingface \
   -v ./data:/app/data \
@@ -110,7 +104,8 @@ docker run -d --name qwen3-asr \
 # CPU version
 docker run -d --name qwen3-asr \
   -p 17003:8000 \
-  -e VOICEPRINT_ENABLED=true \
+  -v ./models/modelscope:/root/.cache/modelscope \
+  -v ./models/huggingface:/root/.cache/huggingface \
   -v ./data:/app/data \
   quantatrisk/qwen3-asr:cpu-latest
 ```
@@ -197,13 +192,8 @@ source .venv/bin/activate
 python start.py
 ```
 
-Startup UI:
-
-- `FUNASR_STARTUP_UI=auto` is the default for single-worker interactive terminals
-- `auto` / `tui` starts a Textual dashboard that owns the terminal, captures child stdout/stderr, shows startup phase progress on top, and streams logs in a dedicated log pane
-- `plain` disables the dashboard and falls back to normal terminal output
-- multi-worker mode always falls back to plain output
-- Docker / `docker-compose logs -f` always use plain output because the container log stream is not an interactive TTY
+Interactive local terminals use the startup UI automatically. Containers and
+multi-worker deployments use normal logs.
 
 ## Runtime Defaults
 
@@ -294,7 +284,7 @@ curl -X POST "http://localhost:8000/v1/audio/transcriptions" \
 | `sample_rate` | int | `16000` | Sample rate |
 | `enable_speaker_diarization` | bool | `true` | Enable speaker diarization |
 | `word_timestamps` | bool | `false` | Return word-level timestamps when the backend supports them. Qwen CUDA vLLM and CPU Rust automatically use the forced aligner when enabled. |
-| `vocabulary_id` | string | - | Hotwords (format: `word1 weight1 word2 weight2`) |
+| `vocabulary_id` | string | - | Hotword context (for example: `word1 word2`). **Deprecated:** numeric weights are unsupported and ignored. |
 
 **Usage Examples:**
 
@@ -358,47 +348,6 @@ Disable speaker diarization:
 ?enable_speaker_diarization=false
 ```
 
-## Voiceprint Database
-
-Persistent speaker identity matching is available in `v1.0.2`. The ASR response
-schema is unchanged: matched identities replace the existing `speaker_id` value,
-and uncertain matches keep the local diarization label.
-
-- **Enabled by Deployment** - Controlled by `VOICEPRINT_ENABLED`, not request parameters
-- **Local Vector Store** - Uses SQLite plus `sqlite-vec`; no external PostgreSQL service is required
-- **Multiple Samples per Speaker** - Register several single-speaker clips for the same identity
-- **Conservative Matching** - Internal score uses `max_score * 0.7 + top3_mean_score * 0.3`
-
-Create a speaker with one or more voiceprint samples:
-
-```bash
-curl -X POST 'http://localhost:8000/api/v1/voiceprint-speakers' \
-  -F 'display_name=Alice' \
-  -F 'file=@tests/files/voiceprint_samples/dialogue_speaker_01_reference.wav'
-```
-
-Add more samples to an existing speaker:
-
-```bash
-curl -X POST 'http://localhost:8000/api/v1/voiceprint-speakers/{speaker_id}/samples' \
-  -F 'file=@tests/files/voiceprint_samples/dialogue_speaker_02_reference.wav'
-```
-
-List registered speakers:
-
-```bash
-curl 'http://localhost:8000/api/v1/voiceprint-speakers'
-```
-
-Soft-delete a speaker:
-
-```bash
-curl -X DELETE 'http://localhost:8000/api/v1/voiceprint-speakers/{speaker_id}'
-```
-
-See [docs/voiceprint-architecture.md](docs/voiceprint-architecture.md) for
-storage and matching design details.
-
 ## Audio Processing
 
 ### Intelligent Segmentation Strategy
@@ -451,53 +400,20 @@ Automatic long audio segmentation:
 - **Environment override**: Set `QWEN3_ASR_MODEL=qwen3-asr-1.7b` or `QWEN3_ASR_MODEL=qwen3-asr-0.6b` to bypass automatic selection
 - `paraformer-large` realtime capability is always prepared for websocket streaming
 
-At startup the service checks the current runtime model plan and downloads missing models by default. Set `HF_HUB_LOCAL_FILES_ONLY=1` only for strictly offline deployments with a prepared cache.
+At startup the service checks the current runtime model plan and downloads missing models by default. Set `HF_HUB_OFFLINE=1` only for strictly offline deployments with a prepared cache.
 
 ## Environment Variables
 
-Recommended public settings:
+Settings in `.env.example`:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `NGINX_PORT` | `17003` | Host port exposed by Docker Compose |
 | `API_KEY` | - | API authentication key (optional, unauthenticated if not set) |
-| `LOG_LEVEL` | `INFO` | Log level (DEBUG/INFO/WARNING/ERROR) |
-| `MAX_AUDIO_SIZE` | `2048` | Max audio file size (MB, supports units like 2GB) |
-| `ASR_BATCH_SIZE` | `4` | ASR batch size for long-audio segment processing |
-| `MAX_SEGMENT_SEC` | `60` | Max audio segment duration (seconds) |
-| `ASR_ENABLE_NEARFIELD_FILTER` | `true` | Enable far-field sound filtering |
+| `CUDA_VISIBLE_DEVICES` | `0` | Visible GPU list; one backend instance is started per visible GPU |
 | `QWEN3_ASR_MODEL` | auto | Force `qwen3-asr-1.7b` or `qwen3-asr-0.6b` instead of VRAM-based selection |
-| `VOICEPRINT_ENABLED` | `true` | Enable persistent voiceprint matching during ASR enrichment |
-| `VOICEPRINT_DB_PATH` | `./data/voiceprints.sqlite3` | SQLite voiceprint database path |
-| `VOICEPRINT_MATCH_THRESHOLD` | `0.70` | Speaker identity match threshold |
-
-Far-field filter notes:
-
-- `ASR_NEARFIELD_RMS_THRESHOLD=0.01` is the current default and recommended starting point
-- raise it in noisy rooms to filter more background speech
-- lower it in quiet rooms if soft speech is being dropped
-- use `LOG_LEVEL=DEBUG` temporarily when you need to inspect filter behavior
-
-Advanced backend-specific settings:
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `QWEN_RUST_CPU_WORKERS` | `4` | CPU Rust backend worker count (Rust ASR / forced align default to 4 runtimes) |
-| `QWENASR_LIBRARY_PATH` | auto-detect | Override vendored Rust dylib/so path |
-
-## Resource Requirements
-
-**Minimum (CPU):**
-
-- CPU: 4 cores
-- Memory: 16GB
-- Disk: 20GB
-
-**Recommended (GPU):**
-
-- CPU: 4 cores
-- Memory: 16GB
-- GPU: NVIDIA GPU (16GB+ VRAM)
-- Disk: 20GB
+| `HF_HUB_OFFLINE` | unset | Set to `1` only after preparing `./models` for offline deployment |
+| `HF_ENDPOINT` | unset | Online Hugging Face mirror endpoint, for example `https://hf-mirror.com` |
 
 ## API Documentation
 

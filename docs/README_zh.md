@@ -28,9 +28,12 @@
 
 <img src="../demo/contact.jpg" alt="微信二维码" width="220">
 
-## Release 1.0.2
+## Release 1.0.3
 
-> `v1.0.2` 新增基于 sqlite-vec 的持久化声纹数据库。`v1.0.0` 相对于早期 `main` 分支引入了一轮大规模 breaking refactor。
+> `v1.0.3` 移除了声纹数据库和 sqlite-vec 依赖，离线部署统一使用
+> `HF_HUB_OFFLINE`，默认部署配置收敛为 `.env.example` 中的少数参数。
+>
+> `v1.0.0` 相对于早期 `main` 分支引入了一轮大规模 breaking refactor。
 > 如果你是从 `main` 升级过来，请先阅读 release 说明，再决定是否沿用旧的部署与运行时假设。
 >
 > 关键 breaking changes：
@@ -39,17 +42,12 @@
 > - `MLX` / Apple Silicon GPU 路径已移除，`mps` 会归一化到 `cpu`
 > - macOS / Apple Silicon 现在默认总是 `qwen3-asr-0.6b`，可通过 `QWEN3_ASR_MODEL` 覆盖
 > - `ENABLED_MODELS` 已移除
+> - 声纹 API 和持久化说话人身份匹配已移除
 >
-> `v1.0.2` 声纹变更：
-> - 声纹匹配由部署环境变量控制，不由 ASR 请求参数控制
-> - 声纹向量使用 SQLite + `sqlite-vec` 存储，不再依赖 PostgreSQL/pgvector
-> - Docker Compose 会将声纹数据库持久化到 `./data`
-
 ## 主要特性
 
 - **混合运行时栈** - 离线推理由自动选择的 Qwen3-ASR 提供，WebSocket 流式由 Paraformer realtime 能力提供
 - **说话人分离** - 基于 CAM++ 模型自动识别多说话人，返回说话人标记
-- **声纹数据库** - 基于 sqlite-vec 持久化说话人身份匹配，复用现有 `speaker_id` 字段
 - **OpenAI API 兼容** - 支持 `/v1/audio/transcriptions` 端点，可直接使用 OpenAI SDK
 - **阿里云 API 兼容** - 支持阿里云语音识别 RESTful API 和 WebSocket 流式协议
 - **WebSocket 流式识别** - 支持实时流式语音识别，低延迟
@@ -86,10 +84,6 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 docker-compose up -d
 - **API 端点**: `http://localhost:17003`
 - **API 文档**: `http://localhost:17003/docs`
 
-可选的内置限流参数：
-- `NGINX_RATE_LIMIT_RPS`（全局每秒请求上限，`0` 表示关闭）
-- `NGINX_RATE_LIMIT_BURST`（全局突发请求数，`0` 时自动使用 RPS）
-
 **docker run 方式（替代）:**
 
 ```bash
@@ -99,7 +93,6 @@ docker run -d --name qwen3-asr \
   -p 17003:8000 \
   -e CUDA_VISIBLE_DEVICES=0,1,2,3 \
   -e API_KEY=your_api_key \
-  -e VOICEPRINT_ENABLED=true \
   -v ./models/modelscope:/root/.cache/modelscope \
   -v ./models/huggingface:/root/.cache/huggingface \
   -v ./data:/app/data \
@@ -108,7 +101,8 @@ docker run -d --name qwen3-asr \
 # CPU 版本
 docker run -d --name qwen3-asr \
   -p 17003:8000 \
-  -e VOICEPRINT_ENABLED=true \
+  -v ./models/modelscope:/root/.cache/modelscope \
+  -v ./models/huggingface:/root/.cache/huggingface \
   -v ./data:/app/data \
   quantatrisk/qwen3-asr:cpu-latest
 ```
@@ -195,13 +189,7 @@ source .venv/bin/activate
 python start.py
 ```
 
-启动界面：
-
-- `FUNASR_STARTUP_UI=auto` 是默认值，单 worker 且当前终端为交互 TTY 时会自动启用
-- `auto` / `tui` 会启动 Textual 启动画面，由父进程接管终端；上方显示启动阶段进度，下方集中显示子进程日志
-- `plain` 会关闭该界面，回退到普通终端输出
-- 多 worker 模式始终回退为普通输出
-- Docker / `docker-compose logs -f` 场景始终使用普通输出，因为容器日志流不是交互式 TTY
+交互式本地终端默认显示启动界面；容器和多 worker 部署使用普通日志输出。
 
 ## 当前运行时默认值
 
@@ -294,7 +282,7 @@ curl -X POST "http://localhost:8000/v1/audio/transcriptions" \
 | `sample_rate`                | int    | `16000`          | 采样率                                |
 | `enable_speaker_diarization` | bool   | `true`           | 启用说话人分离                        |
 | `word_timestamps`            | bool   | `false`          | 返回后端支持的字词级时间戳；Qwen CUDA vLLM 与 CPU Rust 在启用时会自动调用 forced aligner |
-| `vocabulary_id`              | string | -                  | 热词（格式：`词1 权重1 词2 权重2`） |
+| `vocabulary_id`              | string | -                  | 无权重热词上下文（如：`词1 词2`）。**Deprecated：** 数字权重不受支持，传入时会被忽略。 |
 
 **使用示例:**
 
@@ -358,45 +346,6 @@ curl -X POST "http://localhost:8000/stream/v1/asr?enable_speaker_diarization=tru
 ?enable_speaker_diarization=false
 ```
 
-## 声纹数据库
-
-`v1.0.2` 支持持久化说话人身份匹配。ASR 响应结构不变：命中声纹时替换现有
-`speaker_id`，不确定时保留本地说话人分离标签。
-
-- **部署侧启用** - 由 `VOICEPRINT_ENABLED` 控制，不增加请求参数
-- **本地向量库** - 使用 SQLite + `sqlite-vec`，无需额外 PostgreSQL 服务
-- **同一说话人多样本** - 可为一个 speaker 注册多段单人音频
-- **保守匹配策略** - 内部分数为 `max_score * 0.7 + top3_mean_score * 0.3`
-
-创建说话人并注册一个或多个声纹样本：
-
-```bash
-curl -X POST 'http://localhost:8000/api/v1/voiceprint-speakers' \
-  -F 'display_name=Alice' \
-  -F 'file=@tests/files/voiceprint_samples/dialogue_speaker_01_reference.wav'
-```
-
-给已有说话人追加样本：
-
-```bash
-curl -X POST 'http://localhost:8000/api/v1/voiceprint-speakers/{speaker_id}/samples' \
-  -F 'file=@tests/files/voiceprint_samples/dialogue_speaker_02_reference.wav'
-```
-
-查看已注册说话人：
-
-```bash
-curl 'http://localhost:8000/api/v1/voiceprint-speakers'
-```
-
-软删除说话人：
-
-```bash
-curl -X DELETE 'http://localhost:8000/api/v1/voiceprint-speakers/{speaker_id}'
-```
-
-存储结构和匹配策略详见 [voiceprint-architecture.md](voiceprint-architecture.md)。
-
 ## 音频处理
 
 ### 智能分段策略
@@ -449,53 +398,20 @@ curl -X DELETE 'http://localhost:8000/api/v1/voiceprint-speakers/{speaker_id}'
 - **环境变量覆盖**: 设置 `QWEN3_ASR_MODEL=qwen3-asr-1.7b` 或 `QWEN3_ASR_MODEL=qwen3-asr-0.6b` 可跳过自动选择
 - `paraformer-large` 实时能力始终为 WebSocket 流式准备
 
-启动时会先检测当前运行计划所需模型；如果本地缓存缺失，会自动下载。离线部署可显式设置 `HF_HUB_LOCAL_FILES_ONLY=1` 并提前准备模型缓存。
+启动时会先检测当前运行计划所需模型；如果本地缓存缺失，会自动下载。离线部署可显式设置 `HF_HUB_OFFLINE=1` 并提前准备模型缓存。
 
 ## 环境变量
 
-推荐直接关心的公开配置：
+默认部署只需要关注 `.env.example` 中的少数配置：
 
 | 变量                               | 默认值       | 说明                                            |
 | ---------------------------------- | ------------ | ----------------------------------------------- |
-| `API_KEY`                        | -            | API 认证密钥（可选，未配置时无需认证）        |
-| `LOG_LEVEL`                      | `INFO`       | 日志级别（DEBUG/INFO/WARNING/ERROR）          |
-| `MAX_AUDIO_SIZE`                 | `2048`       | 最大音频文件大小（MB，支持单位如 2GB）        |
-| `ASR_BATCH_SIZE`                 | `4`          | 长音频分段后的 ASR 批处理大小 |
-| `MAX_SEGMENT_SEC`                | `60`         | 音频分段最大时长（秒）                        |
-| `ASR_ENABLE_NEARFIELD_FILTER`    | `true`       | 启用远场声音过滤                              |
-| `QWEN3_ASR_MODEL`                | 自动选择      | 强制选择 `qwen3-asr-1.7b` 或 `qwen3-asr-0.6b` |
-| `VOICEPRINT_ENABLED`             | `true`       | 启用 ASR 结果声纹身份匹配                     |
-| `VOICEPRINT_DB_PATH`             | `./data/voiceprints.sqlite3` | SQLite 声纹数据库路径          |
-| `VOICEPRINT_MATCH_THRESHOLD`     | `0.70`       | 说话人身份匹配阈值                            |
-
-远场过滤调优建议：
-
-- `ASR_NEARFIELD_RMS_THRESHOLD=0.01` 是当前默认值，也是推荐起点
-- 嘈杂环境可以适当调高，增强背景语音过滤
-- 安静环境如果出现小声说话漏识别，可以适当调低
-- 需要观察过滤行为时，可临时设置 `LOG_LEVEL=DEBUG`
-
-后端专项高级配置：
-
-| 变量 | 默认值 | 说明 |
-| --- | --- | --- |
-| `QWEN_RUST_CPU_WORKERS` | `4` | CPU Rust backend worker 数（Rust ASR / forced align 默认 4 个 runtime） |
-| `QWENASR_LIBRARY_PATH` | 自动探测 | 覆盖 vendored Rust 动态库路径 |
-
-## 资源需求
-
-**最小配置（CPU）:**
-
-- CPU: 4 核
-- 内存: 16GB
-- 磁盘: 20GB
-
-**推荐配置（GPU）:**
-
-- CPU: 4 核
-- 内存: 16GB
-- GPU: NVIDIA GPU (16GB+ 显存)
-- 磁盘: 20GB
+| `NGINX_PORT`                    | `17003`     | Docker Compose 映射到宿主机的端口             |
+| `API_KEY`                       | -           | API 认证密钥（可选，未配置时无需认证）        |
+| `CUDA_VISIBLE_DEVICES`          | `0`         | GPU Compose 可见设备列表，多卡用 `0,1,2,3`   |
+| `QWEN3_ASR_MODEL`               | 自动选择     | 强制选择 `qwen3-asr-1.7b` 或 `qwen3-asr-0.6b` |
+| `HF_HUB_OFFLINE`                | `0`         | 离线部署且模型已准备好时设为 `1`              |
+| `HF_ENDPOINT`                   | -           | 在线镜像站；离线部署不要设置                  |
 
 ## API 文档
 

@@ -2,10 +2,6 @@
 
 快速部署 Qwen3-ASR 语音识别服务，支持 CPU/macOS 与 NVIDIA GPU 两种运行形态。
 
-如果你正在继续验证本轮 CUDA 官方 vLLM 迁移，请同时参考：
-
-- [PENDING_CUDA_VLLM_HANDOFF.md](./TODO/PENDING_CUDA_VLLM_HANDOFF.md)
-
 依赖安装现在改成根目录默认 GPU，CPU 为单独特化环境：
 
 | 模式 | 命令 | 说明 |
@@ -34,7 +30,6 @@ docker run -d --name qwen3-asr \
   -v ./data:/app/data \
   -v ./logs:/app/logs \
   -v ./temp:/app/temp \
-  -e VOICEPRINT_ENABLED=true \
   quantatrisk/qwen3-asr:gpu-latest
 
 # 或使用 docker-compose（推荐）
@@ -72,28 +67,16 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 docker-compose up -d
 docker run -d --name qwen3-asr \
   -p 17003:8000 \
   -v ./models/modelscope:/root/.cache/modelscope \
+  -v ./models/huggingface:/root/.cache/huggingface \
   -v ./data:/app/data \
   -v ./logs:/app/logs \
   -v ./temp:/app/temp \
-  -e VOICEPRINT_ENABLED=true \
   quantatrisk/qwen3-asr:cpu-latest
 ```
 
-**注意：** CPU 版本不使用 GPU/vLLM 路径。
-当前 CPU 镜像已集成 QwenASR Rust backend，会自动选择 `qwen3-asr-0.6b`。
-CPU 镜像默认使用可分发的 `x86-64-v2` Rust 构建目标，避免把构建机的 native CPU 指令带入通用镜像。
-如果你确认构建机与部署机 CPU 指令集一致，可在自建镜像时设置 `QWENASR_RUST_TARGET_CPU=native` 换取更激进优化。
-当前 Rust backend 的 x86 kernel 需要 `avx2` 与 `fma`，不满足时启动会给出明确错误。镜像默认限制
-`OPENBLAS_NUM_THREADS=1` / `OMP_NUM_THREADS=1` / `GOTO_NUM_THREADS=1`，以减少多 runtime 并发时的线程争抢。
-CUDA vLLM 与 CPU Rust 路径下，`word_timestamps=true` 会自动调用 forced aligner 返回字词级时间戳。
-当前运行时 / 设备默认值以主 README 为准：
-
-- `README.md`
-- `docs/README_zh.md`
-设计背景与实现思路可参考：
-
-- 当前 Qwen3 后端：`CUDA -> vLLM`、`CPU/macOS -> vendored QwenASR Rust`
-- 引用项目 [QwenASR](https://github.com/huanglizhuo/QwenASR)
+CPU 镜像使用 QwenASR Rust，并自动选择 `qwen3-asr-0.6b`。x86_64 需要
+`avx2` 与 `fma`；`word_timestamps=true` 会加载 forced aligner。构建目标与
+运行时选择见主 README。
 
 ### macOS / Apple Silicon 本地部署
 
@@ -140,7 +123,7 @@ curl -X POST "http://localhost:17003/v1/audio/transcriptions" \
 ./build.sh -t gpu
 
 # 构建指定版本并推送
-./build.sh -t all -v 1.0.2 -p
+./build.sh -t all -v 1.0.3 -p
 
 # 查看帮助
 ./build.sh -h
@@ -206,30 +189,9 @@ docker build -t qwen3-asr:gpu-cu130 -f Dockerfile.gpu \
 | `TORCH_CUDA_ARCH_LIST` | `12.0+PTX` | 指定 JIT 编译目标架构 |
 | `VLLM_PACKAGE` | `vllm[audio]==0.19.0` | 覆盖 vLLM 包版本或来源 |
 
-### 模型说明
-
-服务支持以下 ASR 模型：
-
-| 模型 | 说明 | 适用场景 |
-|------|------|----------|
-| Qwen3-ASR-1.7B ⭐ | 多语言 ASR（52种语言+方言，字级时间戳） | CUDA |
-| Qwen3-ASR-0.6B | 轻量版多语言 ASR | CUDA / CPU Rust / macOS |
-| Paraformer Large | WebSocket 实时识别能力 | CPU/GPU 均可 |
-
-**运行时模型选择：**
-
-系统根据机器资源自动选择合适的 Qwen3-ASR 模型：
-- **显存 >= 32GB**: 自动加载 `qwen3-asr-1.7b`
-- **显存 < 32GB**: 自动加载 `qwen3-asr-0.6b`
-- **无 CUDA**: 自动加载基于 vendored Rust 的 `qwen3-asr-0.6b`
-- **macOS / Apple Silicon**: 无论内存大小多少，默认都加载 `qwen3-asr-0.6b`
-- **环境变量覆盖**: 设置 `QWEN3_ASR_MODEL=qwen3-asr-1.7b` 或 `QWEN3_ASR_MODEL=qwen3-asr-0.6b` 可硬覆盖自动选择
-
-`paraformer-large` realtime capability 会始终为 WebSocket 流式识别准备。
-
 ### 模型下载
 
-启动时会先检测当前运行计划所需模型；如果本地缓存缺失，会自动下载。离线部署可显式设置 `HF_HUB_LOCAL_FILES_ONLY=1` 并提前准备模型缓存。
+启动时会先检测当前运行计划所需模型；如果本地缓存缺失，会自动下载。离线部署可显式设置 `HF_HUB_OFFLINE=1` 并提前准备模型缓存。
 手动准备方式：
 
 ```bash
@@ -260,191 +222,8 @@ volumes:
 
 ## 环境变量配置
 
-### 基础配置
-
-| 环境变量 | 默认值 | 说明 |
-|----------|--------|------|
-| `HOST` | `0.0.0.0` | 服务绑定地址 |
-| `PORT` | `8000` | 服务端口 |
-| `DEBUG` | `false` | 调试模式（启用后可访问 /docs） |
-| `LOG_LEVEL` | `INFO` | 日志级别：DEBUG, INFO, WARNING, ERROR |
-| `WORKERS` | `1` | 工作进程数（多进程会复制模型，显存成倍增加） |
-| `MAX_AUDIO_SIZE` | `2048` | 最大音频文件大小（MB，支持单位如 2GB） |
-| `API_KEY` | - | 服务端统一鉴权密钥 |
-
-### 设备配置
-
-| 环境变量 | 默认值 | 说明 |
-|----------|--------|------|
-| `DEVICE` | `auto` | 设备选择：`auto`, `cpu`, `cuda:0` |
-| `CUDA_VISIBLE_DEVICES` | `0` | 可见的 GPU 设备，控制启动实例数量 |
-
-### 内置 Nginx 与限流配置
-
-| 环境变量 | 默认值 | 说明 |
-|----------|--------|------|
-| `NGINX_RATE_LIMIT_RPS` | `0` | 全局每秒请求上限，`0` 表示关闭 |
-| `NGINX_RATE_LIMIT_BURST` | `0` | 全局突发请求数，`0` 时自动取 `NGINX_RATE_LIMIT_RPS` |
-
-### ASR 模型配置
-
-| 环境变量 | 默认值 | 说明 |
-|----------|--------|------|
-| `ASR_ENABLE_REALTIME_PUNC` | `true` | 是否启用实时标点模型 |
-
-### 声纹数据库配置
-
-| 环境变量 | 默认值 | 说明 |
-|----------|--------|------|
-| `VOICEPRINT_ENABLED` | `true` | 是否启用 ASR 结果声纹身份匹配 |
-| `VOICEPRINT_DB_PATH` | `./data/voiceprints.sqlite3` | SQLite + sqlite-vec 声纹数据库路径 |
-| `VOICEPRINT_MATCH_THRESHOLD` | `0.70` | 说话人身份匹配阈值 |
-
-### 性能优化配置
-
-| 环境变量 | 默认值 | 说明 |
-|----------|--------|------|
-| `ASR_BATCH_SIZE` | `4` | 长音频分段后的 ASR 批处理大小 |
-| `INFERENCE_THREAD_POOL_SIZE` | 自动 | 推理线程池大小；默认按 CPU 核数自动设置 |
-| `MAX_SEGMENT_SEC` | `60` | 音频分段最大时长（秒） |
-| `WS_MAX_BUFFER_SIZE` | `160000` | WebSocket 音频缓冲区大小（样本数） |
-| `QWEN_RUST_CPU_WORKERS` | `4` | CPU Rust backend worker 数；Rust ASR / forced align 默认按该数量并行 |
-| `QWEN_RUST_ASR_CONCURRENCY` | `0` | Rust ASR 阶段批内并行度；`0` 表示跟随 `QWEN_RUST_CPU_WORKERS` |
-| `QWEN_RUST_ALIGN_CONCURRENCY` | `0` | Rust forced align 阶段批内并行度；`0` 表示跟随 `QWEN_RUST_CPU_WORKERS` |
-| `QWENASR_LIBRARY_PATH` | 自动探测 | 覆盖 vendored Rust 动态库路径 |
-
-### 远场过滤配置
-
-流式 ASR 远场声音过滤功能，自动过滤远场声音和环境音：
-
-| 环境变量 | 默认值 | 说明 |
-|----------|--------|------|
-| `ASR_ENABLE_NEARFIELD_FILTER` | `true` | 启用远场声音过滤 |
-| `ASR_NEARFIELD_RMS_THRESHOLD` | `0.01` | RMS 能量阈值 |
-| `LOG_LEVEL=DEBUG` | - | 需要观察过滤细节时打开调试日志 |
-
-调优建议：
-
-- `ASR_NEARFIELD_RMS_THRESHOLD=0.01` 是当前默认值，也是推荐起点
-- 嘈杂环境可以适当调高，增强背景语音过滤
-- 安静环境如果出现小声说话漏识别，可以适当调低
-- 需要观察过滤行为时，可临时设置 `LOG_LEVEL=DEBUG`
-
-### 鉴权配置
-
-| 环境变量 | 默认值 | 说明 |
-|----------|--------|------|
-| `API_KEY` | - | 服务端统一鉴权密钥；同时兼容 `Authorization: Bearer` 和 `X-NLS-Token` |
-
-**使用示例：**
-
-```bash
-# 使用 Token
-curl -H "X-NLS-Token: your_token" http://localhost:8000/stream/v1/asr/health
-
-# 使用 Bearer Token（OpenAI 兼容）
-curl -H "Authorization: Bearer your_token" http://localhost:8000/v1/models
-```
-
-### 日志配置
-
-| 环境变量 | 默认值 | 说明 |
-|----------|--------|------|
-| `LOG_LEVEL` | `INFO` | 日志级别：`DEBUG`, `INFO`, `WARNING` |
-| `LOG_FILE` | `logs/qwen3-asr.log` | 日志文件路径 |
-| `LOG_MAX_BYTES` | `20971520` | 单个日志文件最大大小（20MB） |
-| `LOG_BACKUP_COUNT` | `50` | 日志备份文件数量 |
-
-## Docker Compose 配置
-
-### 基础配置（GPU）
-
-```yaml
-services:
-  qwen3-asr:
-    image: quantatrisk/qwen3-asr:gpu-latest
-    container_name: qwen3-asr
-    ports:
-      - "17003:8000"
-    volumes:
-      - ./models/modelscope:/root/.cache/modelscope
-      - ./models/huggingface:/root/.cache/huggingface
-      - ./data:/app/data
-      - ./temp:/app/temp
-      - ./logs:/app/logs
-    environment:
-      - LOG_LEVEL=INFO
-      - VOICEPRINT_ENABLED=true
-      - VOICEPRINT_DB_PATH=./data/voiceprints.sqlite3
-      - VOICEPRINT_MATCH_THRESHOLD=0.70
-      - ASR_BATCH_SIZE=4
-    restart: unless-stopped
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-```
-
-### CPU 版本配置
-
-```yaml
-services:
-  qwen3-asr:
-    image: quantatrisk/qwen3-asr:cpu-latest
-    container_name: qwen3-asr
-    ports:
-      - "17003:8000"
-    volumes:
-      - ./models/modelscope:/root/.cache/modelscope
-      - ./data:/app/data
-      - ./temp:/app/temp
-      - ./logs:/app/logs
-    environment:
-      - LOG_LEVEL=INFO
-      - VOICEPRINT_ENABLED=true
-      - VOICEPRINT_DB_PATH=./data/voiceprints.sqlite3
-      - VOICEPRINT_MATCH_THRESHOLD=0.70
-    restart: unless-stopped
-```
-
-### 生产环境配置（内置 Nginx，推荐）
-
-```yaml
-services:
-  qwen3-asr:
-    image: quantatrisk/qwen3-asr:gpu-latest
-    container_name: qwen3-asr
-    ports:
-      - "17003:8000"
-    volumes:
-      - ./models/modelscope:/root/.cache/modelscope
-      - ./models/huggingface:/root/.cache/huggingface
-      - ./temp:/app/temp
-      - ./data:/app/data
-      - ./logs:/app/logs
-    environment:
-      - DEBUG=false
-      - LOG_LEVEL=INFO
-      - DEVICE=auto
-      - CUDA_VISIBLE_DEVICES=0,1
-      - NGINX_RATE_LIMIT_RPS=20
-      - NGINX_RATE_LIMIT_BURST=40
-      - VOICEPRINT_ENABLED=true
-      - VOICEPRINT_DB_PATH=./data/voiceprints.sqlite3
-      - VOICEPRINT_MATCH_THRESHOLD=0.70
-      - ASR_BATCH_SIZE=4
-    restart: unless-stopped
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-```
+复制 `.env.example` 为 `.env`，仅修改其中已说明的公开变量。GPU 和 CPU
+Compose 文件是运行时配置的唯一来源；其余调优参数保留代码默认值。
 
 ## 服务监控
 
@@ -479,15 +258,15 @@ docker exec -it qwen3-asr nvidia-smi
 ### 最小配置（CPU 版本）
 
 - CPU: 4 核
-- 内存: 8GB
-- 磁盘: 10GB
+- 内存: 16GB
+- 磁盘: 20GB
 
 ### 推荐配置（GPU 版本）
 
-- CPU: 8 核
+- CPU: 4 核
 - 内存: 16GB
-- GPU: NVIDIA GPU (12GB+ 显存，含说话人分离模型)
-- 磁盘: 25GB
+- GPU: NVIDIA GPU (16GB+ 显存)
+- 磁盘: 20GB
 
 ## 故障排除
 
@@ -495,7 +274,7 @@ docker exec -it qwen3-asr nvidia-smi
 
 | 问题 | 症状 | 解决方案 |
 |------|------|----------|
-| GPU 内存不足 | CUDA OOM 错误 | 设置 `DEVICE=cpu` 或使用更大显存的 GPU |
+| GPU 内存不足 | CUDA OOM 错误 | 使用 `qwen3-asr-0.6b` 或部署 CPU 镜像 |
 | 模型加载失败 / 缓慢 | 本地模型缓存缺失 | 先运行 `./scripts/prepare-models.sh` 或 `uv run python -m app.utils.download_models` 预准备模型 |
 | 端口被占用 | 端口冲突错误 | 修改端口映射：`"8080:8000"` |
 | 说话人分离失败 | CAM++ 模型错误 | 检查模型是否完整下载，显存是否充足 |

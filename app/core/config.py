@@ -14,7 +14,7 @@ class Settings:
 
     # 应用信息
     APP_NAME: str = "Qwen3-ASR Server"
-    APP_VERSION: str = "1.0.2"
+    APP_VERSION: str = "1.0.3"
     APP_DESCRIPTION: str = "Qwen3-ASR speech recognition API service"
 
     # 服务器配置
@@ -51,7 +51,6 @@ class Settings:
         "local_files_only": True,  # 强制使用本地模型，禁止联网下载
     }
     ASR_MODELS_CONFIG: str = str(BASE_DIR / "app/services/asr/models.json")
-    ASR_ENABLE_REALTIME_PUNC: bool = True  # 是否启用实时标点模型（用于中间结果展示）
     VAD_MODEL: str = "damo/speech_fsmn_vad_zh-cn-16k-common-pytorch"
     PUNC_MODEL: str = "iic/punc_ct-transformer_zh-cn-common-vocab272727-pytorch"
     PUNC_REALTIME_MODEL: str = (
@@ -72,14 +71,7 @@ class Settings:
 
     # Runtime 并发配置（按 backend 独立控制）
     QWEN_RUST_CPU_WORKERS: int = 4
-    QWEN_RUST_ASR_CONCURRENCY: int = 0
-    QWEN_RUST_ALIGN_CONCURRENCY: int = 0
     FUNASR_WORKERS: int = 1
-
-    # Voiceprint identification configuration.
-    VOICEPRINT_ENABLED: bool = True
-    VOICEPRINT_DB_PATH: str = str(BASE_DIR / "data" / "voiceprints.sqlite3")
-    VOICEPRINT_MATCH_THRESHOLD: float = 0.70
 
     def __init__(self):
         """从环境变量读取配置"""
@@ -106,11 +98,6 @@ class Settings:
 
         # 设备配置
         self.DEVICE = os.getenv("DEVICE", self.DEVICE)
-
-        # ASR模型配置
-        self.ASR_ENABLE_REALTIME_PUNC = (
-            os.getenv("ASR_ENABLE_REALTIME_PUNC", "true").lower() == "true"
-        )
 
         # WebSocket缓冲区配置
         self.WS_MAX_BUFFER_SIZE = int(
@@ -144,29 +131,10 @@ class Settings:
         self.QWEN_RUST_CPU_WORKERS = int(
             os.getenv("QWEN_RUST_CPU_WORKERS", str(self.QWEN_RUST_CPU_WORKERS))
         )
-        self.QWEN_RUST_ASR_CONCURRENCY = int(
-            os.getenv("QWEN_RUST_ASR_CONCURRENCY", str(self.QWEN_RUST_ASR_CONCURRENCY))
-        )
-        self.QWEN_RUST_ALIGN_CONCURRENCY = int(
-            os.getenv("QWEN_RUST_ALIGN_CONCURRENCY", str(self.QWEN_RUST_ALIGN_CONCURRENCY))
-        )
         self.FUNASR_WORKERS = int(
             os.getenv("FUNASR_WORKERS", str(self.FUNASR_WORKERS))
         )
 
-        self.VOICEPRINT_ENABLED = (
-            os.getenv("VOICEPRINT_ENABLED", str(self.VOICEPRINT_ENABLED)).lower()
-            in {"1", "true", "yes", "on"}
-        )
-        self.VOICEPRINT_DB_PATH = (
-            os.getenv("VOICEPRINT_DB_PATH") or self.VOICEPRINT_DB_PATH
-        ).strip()
-        self.VOICEPRINT_MATCH_THRESHOLD = float(
-            os.getenv(
-                "VOICEPRINT_MATCH_THRESHOLD",
-                str(self.VOICEPRINT_MATCH_THRESHOLD),
-            )
-        )
 
     def _parse_size(self, size_str: str) -> int:
         """解析带单位的大小字符串

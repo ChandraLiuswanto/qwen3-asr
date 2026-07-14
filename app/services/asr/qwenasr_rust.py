@@ -15,6 +15,8 @@ from typing import Optional
 
 import numpy as np
 
+from app.infrastructure import resolve_huggingface_snapshot_dir
+
 logger = logging.getLogger(__name__)
 
 _SHARED_LIBRARY: Optional[ctypes.CDLL] = None
@@ -128,60 +130,8 @@ def _read_linux_cpu_flags() -> set[str]:
     return flags
 
 
-def _resolve_hf_snapshot_dir(model_ref: str, cache_root: Path) -> Optional[Path]:
-    if "/" not in model_ref:
-        return None
-
-    org, model = model_ref.split("/", 1)
-    base_dir = cache_root / f"models--{org}--{model}"
-    if not base_dir.exists():
-        return None
-
-    ref_main = base_dir / "refs" / "main"
-    if ref_main.exists():
-        snapshot_name = ref_main.read_text(encoding="utf-8").strip()
-        snapshot_dir = base_dir / "snapshots" / snapshot_name
-        if snapshot_dir.exists():
-            return snapshot_dir.resolve()
-
-    snapshots_dir = base_dir / "snapshots"
-    if snapshots_dir.exists():
-        snapshots = [path for path in snapshots_dir.iterdir() if path.is_dir()]
-        snapshots.sort(key=lambda path: path.stat().st_mtime, reverse=True)
-        if snapshots:
-            return snapshots[0].resolve()
-
-    return None
-
-
 def resolve_qwenasr_model_path(model_ref_or_path: str) -> Path:
-    raw_path = Path(model_ref_or_path).expanduser()
-    if raw_path.exists():
-        return raw_path.resolve()
-
-    cache_roots: list[Path] = []
-    hf_hub_cache = (os.getenv("HF_HUB_CACHE") or "").strip()
-    if hf_hub_cache:
-        cache_roots.append(Path(hf_hub_cache).expanduser())
-
-    hf_home = (os.getenv("HF_HOME") or "").strip()
-    if hf_home:
-        cache_roots.append(Path(hf_home).expanduser() / "hub")
-
-    default_cache_root = Path.home() / ".cache" / "huggingface" / "hub"
-    if default_cache_root not in cache_roots:
-        cache_roots.append(default_cache_root)
-
-    for cache_root in cache_roots:
-        snapshot_dir = _resolve_hf_snapshot_dir(model_ref_or_path, cache_root)
-        if snapshot_dir is not None:
-            return snapshot_dir
-
-    raise FileNotFoundError(
-        f"QwenASR model path not found for '{model_ref_or_path}'. "
-        f"Checked direct path and HuggingFace caches at: "
-        f"{', '.join(str(path) for path in cache_roots)}."
-    )
+    return resolve_huggingface_snapshot_dir(model_ref_or_path)
 
 
 def _bind_ffi_signatures(lib: ctypes.CDLL) -> None:

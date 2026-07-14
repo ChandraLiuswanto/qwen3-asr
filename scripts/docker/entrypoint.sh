@@ -56,7 +56,7 @@ start_internal_nginx_mode() {
   local bind_host="${MULTI_GPU_BIND_HOST:-127.0.0.1}"
   local base_port="18000"
   local public_port="${PORT:-8000}"
-  local ready_timeout="${MULTI_GPU_READY_TIMEOUT:-180}"
+  local ready_timeout="${MULTI_GPU_READY_TIMEOUT:-600}"
   local rate_limit_rps="${NGINX_RATE_LIMIT_RPS:-0}"
   local rate_limit_burst="${NGINX_RATE_LIMIT_BURST:-0}"
 

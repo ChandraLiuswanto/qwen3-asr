@@ -65,10 +65,8 @@ python start.py
   --audio-file temp/podcast_demo_10min_16k.wav \
   --json-out temp/qwen_rust_runtime_config.json
 
-# 通过环境变量切换不同并发配置后再跑
+# 通过环境变量切换 worker 数后再跑
 QWEN_RUST_CPU_WORKERS=8 \
-QWEN_RUST_ASR_CONCURRENCY=8 \
-QWEN_RUST_ALIGN_CONCURRENCY=4 \
 .venv/bin/python -m scripts.benchmark.qwen_rust_sensitivity \
   --audio-file temp/podcast_demo_10min_16k.wav \
   --json-out temp/qwen_rust_runtime_config.json
@@ -77,7 +75,7 @@ QWEN_RUST_ALIGN_CONCURRENCY=4 \
 说明：
 
 - 脚本只跑当前一组配置
-- 并发度由 `QWEN_RUST_CPU_WORKERS`、`QWEN_RUST_ASR_CONCURRENCY`、`QWEN_RUST_ALIGN_CONCURRENCY` 控制
+- Rust ASR 和 forced align 共享 `QWEN_RUST_CPU_WORKERS`
 - 跑完后会输出一条进度日志，并写入 `--json-out`
 - 如果传了 `--json-out`，脚本还会自动生成同名 `.md` 中文对比报告
 - 也可以显式指定 Markdown 路径：

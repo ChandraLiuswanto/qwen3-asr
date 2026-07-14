@@ -21,8 +21,6 @@ from app.utils.audio_splitter import AudioSplitter
 class WorkerBenchRow:
     cpu_count: int
     rust_workers: int
-    asr_concurrency: int
-    align_concurrency: int
     audio_file: str
     audio_duration_sec: float
     batch_size: int
@@ -67,8 +65,6 @@ def _render_markdown(rows: list[WorkerBenchRow]) -> str:
         f"- CPU 数量：`{cpu_count}`",
         "",
         f"- Rust workers：`{rows[0].rust_workers}`",
-        f"- ASR concurrency：`{rows[0].asr_concurrency}`",
-        f"- Align concurrency：`{rows[0].align_concurrency}`",
         "",
         "| total_sec | RTF | engine_init_sec | vad_sec | asr_sec | align_sec | segments | word_tokens | text_len |",
         "|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
@@ -95,7 +91,7 @@ def _render_markdown(rows: list[WorkerBenchRow]) -> str:
             "",
             "## 结论",
             "",
-            f"- 当前配置：workers=`{row.rust_workers}` / asr=`{row.asr_concurrency}` / align=`{row.align_concurrency}`",
+            f"- 当前配置：workers=`{row.rust_workers}`",
             f"- 总耗时：`{row.total_sec:.2f}s`",
             f"- RTF：`{row.rtf:.4f}`",
             "",
@@ -116,8 +112,6 @@ def _log_progress(row: WorkerBenchRow) -> None:
     print(
         (
             f"[bench] workers={row.rust_workers} "
-            f"asr={row.asr_concurrency} "
-            f"align={row.align_concurrency} "
             f"total={row.total_sec:.2f}s "
             f"rtf={row.rtf:.4f} "
             f"asr_sec={row.asr_sec:.2f}s "
@@ -217,8 +211,6 @@ def _summarize(
     return WorkerBenchRow(
         cpu_count=cpu_count,
         rust_workers=settings.QWEN_RUST_CPU_WORKERS,
-        asr_concurrency=settings.QWEN_RUST_ASR_CONCURRENCY or settings.QWEN_RUST_CPU_WORKERS,
-        align_concurrency=settings.QWEN_RUST_ALIGN_CONCURRENCY or settings.QWEN_RUST_CPU_WORKERS,
         audio_file=str(audio_file),
         audio_duration_sec=audio_duration_sec,
         batch_size=batch_size,

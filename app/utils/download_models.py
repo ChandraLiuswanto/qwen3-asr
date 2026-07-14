@@ -15,6 +15,14 @@ from typing import Optional
 
 from huggingface_hub import snapshot_download as hf_snapshot_download
 from modelscope.hub.snapshot_download import snapshot_download as ms_snapshot_download
+
+from app.core.config import settings
+from app.infrastructure import (
+    find_huggingface_snapshot_dir,
+    get_huggingface_cache_root,
+    get_huggingface_model_cache_dir,
+    is_huggingface_offline,
+)
 from app.services.asr.model_capabilities import (
     get_camplusplus_replacement_paths,
     get_download_modelscope_assets,
@@ -37,22 +45,21 @@ def _get_huggingface_assets():
         print("CPU 环境加载当前运行计划所需的 Qwen 模型（含 forced aligner）")
     return hf_assets
 
+
 def _get_cache_path(model_id: str, source: str = "modelscope") -> Path:
-    """获取模型缓存路径"""
     if source == "huggingface":
-        # HF 缓存格式: ~/.cache/huggingface/hub/models--{org}--{model}/
-        cache_dir = Path.home() / ".cache" / "huggingface" / "hub"
-        org, model = model_id.split("/", 1)
-        model_path = cache_dir / f"models--{org}--{model}"
-    else:
-        cache_dir = Path.home() / ".cache" / "modelscope"
-        model_path = cache_dir / "hub" / "models" / model_id
-    return model_path
+        return get_huggingface_model_cache_dir(model_id)
+    return Path(settings.MODELSCOPE_PATH) / model_id
 
 
 def check_model_exists(model_id: str, source: str = "modelscope") -> tuple[bool, str]:
-    """检查模型是否已存在于本地缓存"""
     try:
+        if source == "huggingface":
+            snapshot_dir = find_huggingface_snapshot_dir(model_id)
+            if snapshot_dir is not None:
+                return True, str(snapshot_dir)
+            return False, ""
+
         model_path = _get_cache_path(model_id, source)
 
         if model_path.exists() and model_path.is_dir():
@@ -74,13 +81,13 @@ def check_all_models() -> list[tuple[str, str, str, Optional[str]]]:
     ms_assets = get_download_modelscope_assets()
     hf_assets = _get_huggingface_assets()
 
-    # 检查 ModelScope 模型
+    # Check ModelScope models.
     for asset in ms_assets:
         exists, _ = check_model_exists(asset.model_id, source="modelscope")
         if not exists:
             missing.append((asset.model_id, asset.description, "modelscope", asset.revision))
 
-    # 检查 HuggingFace 模型 (HF 模型暂不支持指定版本)
+    # Check Hugging Face models. HF assets currently do not use pinned revisions.
     for asset in hf_assets:
         exists, _ = check_model_exists(asset.model_id, source="huggingface")
         if not exists:
@@ -92,26 +99,27 @@ def check_all_models() -> list[tuple[str, str, str, Optional[str]]]:
 def fix_camplusplus_config() -> bool:
     """修复 CAM++ 配置文件，将模型ID替换为本地路径（用于离线环境）
 
-    修复 issue #15: 离线环境下 CAM++ 模型会尝试从 modelscope.cn 获取依赖模型配置
+    Fix issue #15: in offline environments, the CAM++ model tries to fetch
+    dependency model config from modelscope.cn.
 
     Returns:
         是否修复成功
     """
     try:
-        cache_dir = Path.home() / ".cache" / "modelscope" / "hub" / "models"
+        cache_dir = Path(settings.MODELSCOPE_PATH)
         config_file = cache_dir / "iic/speech_campplus_speaker-diarization_common/configuration.json"
 
         if not config_file.exists():
             return False
 
-        # 读取配置文件
+        # Read the config file.
         with open(config_file, 'r', encoding='utf-8') as f:
             config = json.load(f)
 
-        # 需要替换的模型ID -> 本地路径映射
+        # Model id to local path replacements.
         replacements = get_camplusplus_replacement_paths(str(cache_dir))
 
-        # 检查是否需要修改
+        # Check whether any replacement is needed.
         modified = False
         if "model" in config:
             for key in ["speaker_model", "change_locator", "vad_model"]:
@@ -119,12 +127,12 @@ def fix_camplusplus_config() -> bool:
                     old_value = config["model"][key]
                     if old_value in replacements:
                         new_value = replacements[old_value]
-                        # 检查本地路径是否存在
+                        # Check whether the local path exists.
                         if Path(new_value).exists():
                             config["model"][key] = new_value
                             modified = True
 
-        # 写回配置文件
+        # Write the config file back.
         if modified:
             with open(config_file, 'w', encoding='utf-8') as f:
                 json.dump(config, f, indent=4, ensure_ascii=False)
@@ -152,7 +160,7 @@ def download_models(
     """
     import shutil
 
-    # 检查缺失的模型
+    # Check missing models.
     missing = check_all_models()
     ms_assets = get_download_modelscope_assets()
     hf_assets = _get_huggingface_assets()
@@ -165,8 +173,14 @@ def download_models(
         if not export_path:
             return True
 
-    ms_cache_dir = Path.home() / ".cache" / "modelscope"
-    hf_cache_dir = Path.home() / ".cache" / "huggingface"
+    if missing and is_huggingface_offline():
+        print("Offline mode is enabled; missing models will not be downloaded.")
+        for model_id, *_ in missing:
+            print(f"  - {model_id}")
+        return False
+
+    ms_cache_dir = Path(settings.MODELSCOPE_PATH)
+    hf_cache_dir = get_huggingface_cache_root()
 
     if auto_mode:
         print(f"📦 检测到 {len(missing)} 个模型需要下载...")
@@ -182,7 +196,7 @@ def download_models(
     failed = []
     downloaded = []
 
-    # 下载 ModelScope 模型 (Paraformer)
+    # Download ModelScope models (Paraformer).
     ms_missing = [(mid, desc, rev) for mid, desc, src, rev in missing if src == "modelscope"]
     if ms_missing:
         if not auto_mode:
@@ -198,7 +212,7 @@ def download_models(
                 print(f"    📥 开始下载...", end="")
 
             try:
-                # 传递版本参数，如果指定了版本
+                # Pass the revision parameter when specified.
                 if revision:
                     path = ms_snapshot_download(model_id, revision=revision)
                 else:
@@ -211,7 +225,7 @@ def download_models(
                     print(f" ❌ 失败: {e}")
                 failed.append((model_id, str(e)))
 
-    # 下载 HuggingFace 模型 (Qwen3-ASR)
+    # Download Hugging Face models (Qwen3-ASR).
     hf_missing = [(mid, desc, rev) for mid, desc, src, rev in missing if src == "huggingface"]
     if hf_missing:
         if not auto_mode:
@@ -234,7 +248,7 @@ def download_models(
                     print(f" ❌ 失败: {e}")
                 failed.append((model_id, str(e)))
 
-    # 修复 CAM++ 配置文件（用于离线环境）
+    # Fix CAM++ config files for offline environments.
     if not auto_mode:
         print("\n🔧 修复 CAM++ 配置文件...")
     if fix_camplusplus_config():
@@ -244,16 +258,16 @@ def download_models(
         if not auto_mode:
             print("  ℹ️  无需修复或配置文件不存在")
 
-    # 导出模式：复制模型到项目 models/ 目录（与 docker-compose 挂载路径一致）
+    # Export mode: copy models to the project models directory.
     if export_path and not failed:
         if not auto_mode:
             print(f"\n📦 导出模型到: {export_path}")
 
-        # models/modelscope/ 和 models/huggingface/ 结构
+        # Preserve the models/modelscope and models/huggingface layout.
         ms_target = export_path / "modelscope"
         hf_target = export_path / "huggingface"
 
-        # 收集所有需要导出的模型
+        # Collect all models that need exporting.
         all_models = []
         for asset in ms_assets:
             all_models.append((asset.model_id, "modelscope"))
@@ -264,12 +278,10 @@ def download_models(
         for model_id, source in all_models:
             cache_path = _get_cache_path(model_id, source)
             if cache_path.exists():
-                # 计算相对路径，保持原结构
                 if source == "modelscope":
-                    rel_path = cache_path.relative_to(Path.home() / ".cache" / "modelscope")
-                    target_dir = ms_target / rel_path
+                    target_dir = ms_target / "hub" / "models" / model_id
                 else:
-                    rel_path = cache_path.relative_to(Path.home() / ".cache" / "huggingface" / "hub")
+                    rel_path = cache_path.relative_to(get_huggingface_cache_root())
                     target_dir = hf_target / "hub" / rel_path
 
                 target_dir.parent.mkdir(parents=True, exist_ok=True)

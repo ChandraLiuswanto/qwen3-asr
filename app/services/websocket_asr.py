@@ -612,10 +612,9 @@ class AliyunWebSocketASRService:
                 result_text_raw = result[0].get("text", "").strip()
                 result_text_with_punc = result_text_raw
 
-                # 如果启用实时标点且用户要求标点，则应用实时标点恢复（仅用于中间结果展示）
+                # Apply realtime punctuation to intermediate results when requested.
                 if (
                     result_text_raw
-                    and settings.ASR_ENABLE_REALTIME_PUNC
                     and params.get("enable_punctuation_prediction", True)
                     and not params.get("_disable_realtime_punc", False)
                     and self._should_apply_realtime_punc(result_text_raw)

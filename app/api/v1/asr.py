@@ -109,7 +109,7 @@ async def get_asr_params(request: Request) -> ASRQueryParams:
 
 ## 注意事项
 - 离线路径固定使用服务当前启用的 Qwen3-ASR 模型；通过 `QWEN3_ASR_MODEL` 控制型号
-- `vocabulary_id` 参数用于传递热词，格式：`热词1 权重1 热词2 权重2`（如：`阿里巴巴 20 腾讯 15`）
+- `vocabulary_id` 参数用于传递无权重热词上下文（如：`阿里巴巴 腾讯`）。[Deprecated] 数字权重语法不受支持，传入时会被忽略
 - 音频会自动转换为 16kHz 采样率进行识别
 """,
     openapi_extra={
@@ -169,9 +169,9 @@ async def get_asr_params(request: Request) -> ASRQueryParams:
                 "schema": {
                     "type": "string",
                     "maxLength": 512,
-                    "example": "阿里巴巴 20 腾讯 15",
+                    "example": "阿里巴巴 腾讯",
                 },
-                "description": "热词字符串，格式：`热词1 权重1 热词2 权重2`。权重范围 1-100，建议 10-30。可提升特定词汇的识别准确率",
+                "description": "无权重热词上下文，例如：`阿里巴巴 腾讯`。[Deprecated] 数字权重语法不受支持，传入时会被忽略",
             },
             # 6. 认证参数
             {
