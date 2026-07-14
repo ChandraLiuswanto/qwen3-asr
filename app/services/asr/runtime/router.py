@@ -44,7 +44,11 @@ class OfflineASRRequest:
 class RuntimeEngineLease:
     """Lifecycle wrapper around a pooled engine instance."""
 
-    def __init__(self, engine: BaseASREngine, release_callback: Callable[[], None | Awaitable[None]]):
+    def __init__(
+        self,
+        engine: BaseASREngine,
+        release_callback: Callable[[], None | Awaitable[None]],
+    ):
         self.engine = engine
         self._release_callback = release_callback
         self._closed = False
@@ -69,9 +73,12 @@ class RuntimeRouter:
 
     def __init__(self):
         self._manager = get_model_manager()
-        self._pools: dict[tuple[RuntimeFamily, str], LocalEnginePool[BaseASREngine]] = {}
+        self._pools: dict[tuple[RuntimeFamily, str], LocalEnginePool[BaseASREngine]] = (
+            {}
+        )
         self._shared_engines: dict[tuple[RuntimeFamily, str], BaseASREngine] = {}
         self._shared_limits: dict[tuple[RuntimeFamily, str], asyncio.Semaphore] = {}
+        self._vllm_offline_locks: dict[str, asyncio.Lock] = {}
         self._pool_lock = threading.Lock()
         self._loaded_model_ids: set[str] = set()
 
@@ -98,7 +105,9 @@ class RuntimeRouter:
             return settings.QWEN_RUST_CPU_WORKERS
         return settings.FUNASR_WORKERS
 
-    def _create_pool(self, family: RuntimeFamily, model_id: str) -> LocalEnginePool[BaseASREngine]:
+    def _create_pool(
+        self, family: RuntimeFamily, model_id: str
+    ) -> LocalEnginePool[BaseASREngine]:
         pool_key = (family, model_id)
         existing = self._pools.get(pool_key)
         if existing is not None:
@@ -116,7 +125,9 @@ class RuntimeRouter:
             self._loaded_model_ids.add(model_id)
             return pool
 
-    def _get_shared_engine(self, family: RuntimeFamily, model_id: str) -> tuple[BaseASREngine, asyncio.Semaphore]:
+    def _get_shared_engine(
+        self, family: RuntimeFamily, model_id: str
+    ) -> tuple[BaseASREngine, asyncio.Semaphore]:
         runtime_key = (family, model_id)
         engine = self._shared_engines.get(runtime_key)
         semaphore = self._shared_limits.get(runtime_key)
@@ -162,7 +173,9 @@ class RuntimeRouter:
 
         return memory_info
 
-    async def acquire_engine(self, model_id: Optional[str] = None) -> RuntimeEngineLease:
+    async def acquire_engine(
+        self, model_id: Optional[str] = None
+    ) -> RuntimeEngineLease:
         resolved_model_id = self.resolve_model_id(model_id)
         family = self._resolve_family(resolved_model_id)
         if family == RuntimeFamily.QWEN_VLLM:
@@ -180,7 +193,19 @@ class RuntimeRouter:
         )
 
     async def run_offline(self, request: OfflineASRRequest) -> ASRFullResult:
-        async with await self.acquire_engine(request.model_id) as engine:
+        model_id = self.resolve_model_id(request.model_id)
+        if self._resolve_family(model_id) == RuntimeFamily.QWEN_VLLM:
+            lock = self._vllm_offline_locks.setdefault(model_id, asyncio.Lock())
+            async with lock:
+                return await self._run_offline(request, model_id)
+        return await self._run_offline(request, model_id)
+
+    async def _run_offline(
+        self,
+        request: OfflineASRRequest,
+        model_id: str,
+    ) -> ASRFullResult:
+        async with await self.acquire_engine(model_id) as engine:
             return await run_sync(
                 engine.transcribe_long_audio,
                 audio_path=request.audio_path,
