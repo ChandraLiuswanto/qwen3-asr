@@ -62,6 +62,7 @@ class Settings:
 
     # 批处理推理配置（GPU 真并行）
     ASR_BATCH_SIZE: int = 4  # ASR 批处理大小（同时推理的片段数），建议 2-8
+    DIARIZATION_SV_BATCH_SIZE: int = 32  # 说话人分离 SV embedding 批处理大小，显存越大可调越高
 
     # 音频分段配置
     MAX_SEGMENT_SEC: float = 60.0  # Max offline ASR segment duration in seconds.
@@ -114,6 +115,10 @@ class Settings:
 
         self.ASR_BATCH_SIZE = int(
             os.getenv("ASR_BATCH_SIZE", str(self.ASR_BATCH_SIZE))
+        )
+
+        self.DIARIZATION_SV_BATCH_SIZE = int(
+            os.getenv("DIARIZATION_SV_BATCH_SIZE", str(self.DIARIZATION_SV_BATCH_SIZE))
         )
 
         self.MAX_SEGMENT_SEC = float(

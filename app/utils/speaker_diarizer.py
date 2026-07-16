@@ -236,7 +236,9 @@ def get_global_diarization_pipeline() -> Any:
                     modelscope_device=modelscope_device,
                 )
                 _global_diarization_pipeline = _enable_batched_sv(
-                    _global_diarization_pipeline, modelscope_device
+                    _global_diarization_pipeline,
+                    modelscope_device,
+                    max_batch_size=settings.DIARIZATION_SV_BATCH_SIZE,
                 )
                 logger.info("CAM++ 模型加载成功（已启用 batched SV）")
             except Exception as e:
