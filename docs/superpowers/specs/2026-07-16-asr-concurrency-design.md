@@ -290,3 +290,1061 @@ If ROCm is installed, `torch.cuda.is_available()` may return `True`, making `det
 **r3** — restructured around three coordinated changes; added the (now removed) estimates table; added the size-based design principle and pooling; recorded `_enable_batched_sv` as already-on; added rejected alternatives; added Development Environment.
 
 **r2 corrected r1** — two engines not one (r1 specified a single lock; the aligner is separate); root cause demoted to unverified hypothesis; lazy aligner init promoted from comment to guarded site; H100 incorporated; diarization mutex promoted to in-scope; executor starvation named; success criteria made executable; websocket file paths corrected.
+
+## Plan
+
+# ASR Concurrency — Implementation Plan (Tasks 1, 2, Change A)
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+>
+> **NO COMMITS.** Workers make no git commits. Skip every "commit" step you would normally add; the branch owner integrates as a single commit at the end (see Success criteria: "single commit").
+
+**Goal:** Verify the vLLM root-cause hypothesis (task 1), instrument the offline stage breakdown (task 2), and land change A — narrow the router lock to per-engine backend locks with every accidental-protection site guarded — per the Spec's "The changes → A" section.
+
+**Architecture:** See Spec sections "Root cause", "The engines and their call sites", and "The changes → A". This plan does not restate them; each task cites the spec item it implements.
+
+**Tech Stack:** Python 3 / FastAPI / vLLM 0.19.0 (H100 only) / `threading.Lock` / `unittest` (`tests/` uses `unittest.IsolatedAsyncioTestCase`, run via `python -m pytest tests/ -v`).
+
+**Deliberately out of scope:** Changes **B** (small-model pooling) and **C** (async engine) are NOT planned here. C is gated on task 1's verdict; B is gated on A landing and task 2's measurements showing where the time goes. Plan them after tasks 1 and 2 have run on the H100.
+
+### Global Constraints
+
+- **Dev box is an AMD APU, non-CUDA. vLLM will not install** (`pyproject.toml:33`). Every task below is tagged **[LOCAL]** (structural work + unit tests with fakes, runnable on the dev box) or **[H100-ONLY]** (requires the deployed image; nobody has access yet — these tasks produce runbooks/scripts now and are *executed* later). Do not attempt to run a `[H100-ONLY]` step locally; do not claim a `[LOCAL]` task "verifies" concurrency behavior — locally you can only verify lock structure with fakes (Spec: "Development environment").
+- Set `DEVICE=cpu` in any local run to avoid the ROCm false-CUDA trap (Spec: "Development environment").
+- TDD wherever a fake-engine unit test can express the behavior; the mixing/race behavior itself is only testable on the H100 (Spec: "Success criteria").
+- No `git pull`/fetch/rebase during the branch; single final commit by the branch owner; **workers commit nothing**.
+- All of A's guards (Tasks 3–7) must land **together** — removing the router lock (Task 6) with any guard missing trades one bug for another (Spec: "A's scope").
+- Run tests with: `python -m pytest tests/ -v` from the repo root.
+
+### Task dependency graph
+
+```
+Task 1 [H100-ONLY runbook now, execute later]  — independent; gates future C
+Task 2 [LOCAL instrumentation] → Task 2b [H100-ONLY measurement run] — independent of A
+Task 3 (backend locks)   ─┐
+Task 4 (VAD lock wire)    ├─ [LOCAL, parallel with each other and with 1/2]
+Task 5 (ITN guard)        │
+Task 7 (semaphore/executor)┘
+Task 8 (singleton re-grep audit) — after 3,4,5; before 6
+Task 6 (remove router lock + fix test_runtime_router) — LAST of the A tasks; depends on 3,4,5,7,8
+Task 9 [H100-ONLY] integration test scripts — written any time after 3–7; executed on H100
+```
+
+Tasks 1, 2, 3, 4, 5, 7 can run in parallel (disjoint files). Task 6 must be last among A tasks.
+
+---
+
+### Task 1: Verify the vLLM root-cause hypothesis [H100-ONLY execution; runbook + probe script written locally]
+
+Implements Spec "Root cause — LOAD-BEARING AND NOT YET VERIFIED" and Ordering step 1. Gates change C (out of scope here); does **not** gate A.
+
+**Files:**
+- Create: `scripts/h100/verify_vllm_root_cause.py`
+
+**Interfaces:**
+- Produces: a written verdict (CONFIRMED / REFUTED, recorded in the spec's changelog by the branch owner) on: (a) does `LLM.generate` at 0.19.0 drain the shared `LLMEngine` without filtering to the caller's request IDs? (b) does `vllm.v1.engine.async_llm.AsyncLLM` import at 0.19.0, and does the `AsyncLLMEngine` alias still exist? (c) does `AsyncLLM` support pooling/`encode` with multimodal audio (for the aligner question in C)?
+
+- [ ] **Step 1: Write the probe script (local, structural only — it will not run locally)**
+
+```python
+# scripts/h100/verify_vllm_root_cause.py
+"""H100-ONLY. Run inside the deployed image (vllm[audio]==0.19.0).
+
+Answers the three questions gating change C. Prints source excerpts; the
+human reads them and records CONFIRMED/REFUTED in the spec changelog.
+"""
+import inspect
+import sys
+
+
+def main() -> int:
+    import vllm
+    print(f"vllm version: {vllm.__version__}")
+
+    # Q(a): does LLM.generate/_run_engine filter outputs to this caller's request ids?
+    from vllm.entrypoints.llm import LLM
+    print("\n===== LLM.generate source =====")
+    print(inspect.getsource(LLM.generate))
+    for name in ("_run_engine", "_validate_and_add_requests"):
+        fn = getattr(LLM, name, None)
+        if fn is not None:
+            print(f"\n===== LLM.{name} source =====")
+            print(inspect.getsource(fn))
+    # Read the printed source. CONFIRMED if _run_engine collects
+    # engine.step() outputs without restricting to the request ids this
+    # generate() call added; REFUTED if it filters/queues per caller.
+
+    # Q(b): AsyncLLM availability and the alias.
+    try:
+        from vllm.v1.engine.async_llm import AsyncLLM
+        print("\nAsyncLLM import: OK", AsyncLLM)
+    except ImportError as exc:
+        print("\nAsyncLLM import FAILED:", exc)
+    try:
+        from vllm import AsyncLLMEngine  # compatibility alias
+        print("AsyncLLMEngine alias: OK", AsyncLLMEngine)
+    except ImportError as exc:
+        print("AsyncLLMEngine alias FAILED:", exc)
+
+    # Q(c): pooling/encode surface on the async engine (aligner concern for C).
+    try:
+        from vllm.v1.engine.async_llm import AsyncLLM
+        members = [m for m in dir(AsyncLLM) if m in ("encode", "pooling", "generate")]
+        print("AsyncLLM relevant members:", members)
+        if hasattr(AsyncLLM, "encode"):
+            print("\n===== AsyncLLM.encode signature =====")
+            print(inspect.signature(AsyncLLM.encode))
+    except Exception as exc:
+        print("AsyncLLM inspection failed:", exc)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+- [ ] **Step 2 [H100-ONLY]: Run it in the deployed image**
+
+Run: `python scripts/h100/verify_vllm_root_cause.py | tee /tmp/vllm_root_cause.txt`
+Expected: script completes; source of `LLM.generate`/`_run_engine` printed.
+
+- [ ] **Step 3 [H100-ONLY]: Read the output and record the verdict**
+
+Decision rule (from Spec "Root cause"): the hypothesis is CONFIRMED iff the drain loop collects finished outputs without filtering to the caller's own request IDs. Record CONFIRMED/REFUTED plus the AsyncLLM answers. If REFUTED, changes A's *lock necessity for mixing* is weakened but A still stands on the documented "`LLM` is not thread-safe" stance and the tokenizer/ITN/VAD races — note this and re-review C's premise before scoping C.
+
+---
+
+### Task 2: Instrument the offline stage breakdown [LOCAL structural + H100-ONLY measurement]
+
+Implements Spec Ordering step 2 ("supplies the numbers this spec refuses to guess"). Independent of A. Informs whether C is worth it and B's priorities.
+
+**Files:**
+- Modify: `app/services/asr/engines/base.py` — `transcribe_long_audio` (the diarization/split/batch/align pipeline around lines 152–186)
+- Test: `tests/test_stage_timings.py`
+
+**Interfaces:**
+- Produces: one structured log line per offline request:
+  `ASR_STAGE_TIMINGS task_id=<id> total_s=<f> diarization_s=<f> vad_split_s=<f> inference_s=<f> alignment_s=<f> segments=<n> batches=<n>` emitted via the module `logger` at INFO. Stages that did not run report `0.000` (Spec "Request shapes": stages are conditional). No behavior change.
+- **Known limitation (deliberate):** `alignment_s` is ALWAYS `0.000` in this task. Alignment runs *inside* the backend's `transcribe_batch`, per segment, interleaved within each batch call (`qwen3_vllm.py:352` — `align_transcript` is invoked from the batch loop in `qwen3_vllm.py`, not from `base.py`), so `base.py`'s batch loop cannot separate it from inference. Consequently, for `word_timestamps=True` requests, `inference_s` INCLUDES alignment time. Default traffic (`word_timestamps=False`, the shape task 2b measures) has zero alignment, so its numbers are exact. If alignment ever needs its own number, that requires threading timing accumulators out of the backend's `transcribe_batch` return value — out of scope here; record it as a follow-up if `word_timestamps` traffic becomes a measurement target. The field is kept in the format so the log-line schema does not change later.
+
+- [ ] **Step 1: Read `app/services/asr/engines/base.py` in full** and locate: the `enable_speaker_diarization` block (~152), the `AudioSplitter` fallback (~161–167), the batch inference loop (~186), and whatever alignment/post-processing follows. Adjust the exact insertion points below to what you find — the spec's line numbers are verified but the file may have drifted.
+
+- [ ] **Step 2: Write the failing test**
+
+```python
+# tests/test_stage_timings.py
+from __future__ import annotations
+
+import logging
+import unittest
+from unittest import mock
+
+
+class StageTimingLogTest(unittest.TestCase):
+    def test_stage_timing_log_line_shape(self) -> None:
+        # Unit-test the formatting helper directly; the full pipeline
+        # needs real models and is H100-only.
+        from app.services.asr.engines.base import format_stage_timings
+
+        line = format_stage_timings(
+            task_id="t1",
+            total_s=12.345,
+            diarization_s=3.0,
+            vad_split_s=0.0,
+            inference_s=8.5,
+            alignment_s=0.0,
+            segments=5,
+            batches=2,
+        )
+        self.assertIn("ASR_STAGE_TIMINGS", line)
+        self.assertIn("task_id=t1", line)
+        self.assertIn("diarization_s=3.000", line)
+        self.assertIn("vad_split_s=0.000", line)
+        self.assertIn("inference_s=8.500", line)
+        self.assertIn("batches=2", line)
+```
+
+- [ ] **Step 3: Run it — must fail** with `ImportError: cannot import name 'format_stage_timings'`.
+
+Run: `python -m pytest tests/test_stage_timings.py -v`
+
+- [ ] **Step 4: Implement**
+
+Add to `app/services/asr/engines/base.py` (module level):
+
+```python
+def format_stage_timings(
+    *,
+    task_id: str,
+    total_s: float,
+    diarization_s: float,
+    vad_split_s: float,
+    inference_s: float,
+    alignment_s: float,
+    segments: int,
+    batches: int,
+) -> str:
+    return (
+        "ASR_STAGE_TIMINGS "
+        f"task_id={task_id} total_s={total_s:.3f} "
+        f"diarization_s={diarization_s:.3f} vad_split_s={vad_split_s:.3f} "
+        f"inference_s={inference_s:.3f} alignment_s={alignment_s:.3f} "
+        f"segments={segments} batches={batches}"
+    )
+```
+
+Inside `transcribe_long_audio`: initialize `import time` accumulators at the top (`_t_total = time.perf_counter()`, `diarization_s = vad_split_s = inference_s = 0.0`, `batches = 0`); wrap the diarizer call, the `AudioSplitter.split_audio_file` call, and each inference batch (the loop at ~:186 — accumulate into `inference_s` and increment `batches`) with `t0 = time.perf_counter()` / `stage_s += time.perf_counter() - t0`. **Do NOT attempt to time alignment separately** — it happens inside the backend's `transcribe_batch` per segment (`qwen3_vllm.py:352`) and is not observable from `base.py`; pass `alignment_s=0.0` always (see the Interfaces limitation above — `inference_s` includes alignment when `word_timestamps=True`). Just before returning, emit `logger.info(format_stage_timings(task_id=str(task_id or ""), total_s=time.perf_counter() - _t_total, ..., alignment_s=0.0))`. Do not change any control flow.
+
+- [ ] **Step 5: Run the test — must pass.** Then run the full suite: `python -m pytest tests/ -v` — no regressions.
+
+- [ ] **Step 6 [H100-ONLY]: Measurement runbook** — on the H100, after deploy: submit 1, then 10 concurrent, 5-minute-audio `POST /v1/audio/transcriptions` requests (defaults: diarization on, no word timestamps); grep the service log for `ASR_STAGE_TIMINGS`; compute per-stage shares and p50/p95 websocket decode latency baseline (the threshold Spec "Risks → Websocket latency" demands). These numbers gate B and C scoping. Record them; do not extrapolate from them locally.
+
+---
+
+### Task 3: Per-engine backend locks in `Qwen3VLLMBackend` [LOCAL]
+
+Implements Spec "The changes → A", scope items **1** and **2**: main-engine `threading.Lock` covering tokenizer+generate in `_decode_stream` and generate in `_run_generate`; aligner engine lock around `encode`; a **separate init-only lock** inside `_get_forced_aligner` (three callers — Spec item 2 explains why naive nesting self-deadlocks and why "caller holds the lock" is wrong for the warmup path).
+
+**Files:**
+- Modify: `app/services/asr/qwen3_vllm.py` — `__init__` (:161–211), `_get_forced_aligner` (:222–249), `_run_generate` (:255–279), `align_transcript` (:376–423), `_decode_stream` (:447–474)
+- Test: `tests/test_qwen3_vllm_locks.py`
+
+**Interfaces:**
+- Produces: three instance attributes on `Qwen3VLLMBackend`: `self._llm_lock: threading.Lock` (main engine + shared tokenizer), `self._aligner_lock: threading.Lock` (aligner `encode`), `self._aligner_init_lock: threading.Lock` (aligner construction only, never held across `encode`). Task 6 relies on these existing before the router lock is removed.
+- Note: `Qwen3VLLMBackend.__init__` imports `vllm` via `importlib` (:170) — it cannot be constructed locally. Tests build the object with `Qwen3VLLMBackend.__new__` and set attributes by hand. This is the sanctioned local pattern; it verifies lock *structure*, not scheduler races (those are Task 9, H100).
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+# tests/test_qwen3_vllm_locks.py
+from __future__ import annotations
+
+import threading
+import time
+import unittest
+
+import numpy as np
+
+from app.services.asr.qwen3_vllm import Qwen3VLLMBackend, VLLMRealtimeState
+
+
+class _FakeOutputToken:
+    text = "hello"
+
+
+class _FakeOutput:
+    outputs = [_FakeOutputToken()]
+
+
+class _ConcurrencyRecorder:
+    """Fake vLLM LLM that records overlapping calls into ONE shared counter.
+
+    The tokenizer fake shares this recorder (see _FakeTokenizer), so
+    max_active counts tokenizer+generate overlap COMBINED. This is what makes
+    the test non-vacuous: an implementation that locks only the generate at
+    :455 leaves tokenizer calls at :450/:453 overlapping other threads'
+    generate — combined max_active > 1 — and MUST fail here (spec A item 1:
+    tokenizer + generate are one critical section).
+    """
+
+    def __init__(self) -> None:
+        self._mu = threading.Lock()
+        self.active = 0
+        self.max_active = 0
+
+    def _enter(self) -> None:
+        with self._mu:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+
+    def _exit(self) -> None:
+        with self._mu:
+            self.active -= 1
+
+    def generate(self, prompts, sampling_params=None, use_tqdm=False):
+        self._enter()
+        time.sleep(0.01)
+        self._exit()
+        return [_FakeOutput() for _ in prompts]
+
+
+class _FakeTokenizer:
+    """Shares the LLM's overlap recorder so a lock covering only generate
+    (starting at :455 instead of before :450) fails the combined assertion."""
+
+    def __init__(self, recorder: _ConcurrencyRecorder) -> None:
+        self._recorder = recorder
+
+    def encode(self, text, add_special_tokens=False):
+        self._recorder._enter()
+        time.sleep(0.005)  # widen the overlap window
+        self._recorder._exit()
+        return [1, 2, 3]
+
+    def decode(self, ids, skip_special_tokens=False):
+        self._recorder._enter()
+        time.sleep(0.005)
+        self._recorder._exit()
+        return "abc"
+
+
+class _FakeSamplingParamsCls:
+    def __init__(self, **kwargs):
+        pass
+
+
+def _bare_backend() -> Qwen3VLLMBackend:
+    backend = Qwen3VLLMBackend.__new__(Qwen3VLLMBackend)
+    backend._llm = _ConcurrencyRecorder()
+    backend._tokenizer = _FakeTokenizer(backend._llm)  # SHARED recorder — see class docstrings
+    backend._sampling_params = object()
+    backend._sampling_params_cls = _FakeSamplingParamsCls
+    backend._max_inference_batch_size = 4
+    backend._forced_aligner_path = "/fake/aligner"
+    backend._forced_aligner = None
+    backend._timestamp_token_id = None
+    backend._timestamp_segment_time = None
+    backend._llm_lock = threading.Lock()
+    backend._aligner_lock = threading.Lock()
+    backend._aligner_init_lock = threading.Lock()
+    return backend
+
+
+def _hammer(fn, n=8):
+    # daemon=True: if the code under test deadlocks, the watchdog's timeout
+    # assertion must be able to fail AND the interpreter must exit — non-daemon
+    # hammer threads would block process exit and hang the whole suite instead
+    # of reporting the failure.
+    threads = [threading.Thread(target=fn, daemon=True) for _ in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+
+class MainEngineLockTest(unittest.TestCase):
+    def test_run_generate_serialized(self) -> None:
+        backend = _bare_backend()
+        audio = np.zeros(160, dtype=np.float32)
+        _hammer(lambda: backend._run_generate([(audio, "", None)]))
+        self.assertEqual(backend._llm.max_active, 1)
+
+    def test_decode_stream_serialized_including_tokenizer(self) -> None:
+        backend = _bare_backend()
+
+        def one_session() -> None:
+            state = VLLMRealtimeState(
+                prompt_raw="p",
+                language="",
+                chunk_size_sec=2.0,
+                unfixed_chunk_num=0,  # forces the tokenizer branch at :450
+                unfixed_token_num=2,
+                max_new_tokens=8,
+                raw_decoded="seed",
+                audio_accum=np.zeros(160, dtype=np.float32),
+            )
+            backend._decode_stream(state)
+
+        _hammer(one_session)
+        # Combined tokenizer+generate overlap (shared recorder). A lock
+        # covering only generate (:455) leaves tokenizer encode/decode
+        # (:450/:453) racing other threads' generate → max_active > 1 → FAIL.
+        self.assertEqual(backend._llm.max_active, 1)
+
+    def test_decode_stream_and_run_generate_share_one_lock(self) -> None:
+        backend = _bare_backend()
+        audio = np.zeros(160, dtype=np.float32)
+
+        def offline() -> None:
+            backend._run_generate([(audio, "", None)])
+
+        def ws() -> None:
+            state = VLLMRealtimeState(
+                prompt_raw="p", language="", chunk_size_sec=2.0,
+                unfixed_chunk_num=0, unfixed_token_num=2, max_new_tokens=8,
+                raw_decoded="seed", audio_accum=audio,
+            )
+            backend._decode_stream(state)
+
+        threads = [threading.Thread(target=offline if i % 2 else ws) for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(backend._llm.max_active, 1)
+
+
+class _Sentinel(Exception):
+    """Raised by the fake aligner's encode so align_transcript stops after
+    the code under test (init + lock acquisition + encode) has run."""
+
+
+class AlignerLockTest(unittest.TestCase):
+    def test_align_transcript_does_not_self_deadlock_and_serializes_encode(self) -> None:
+        # Spec item 2: the init-only lock and the encode lock must not nest
+        # a non-reentrant Lock. With no warmup (aligner starts None), the
+        # first align_transcript call exercises the REAL _get_forced_aligner
+        # init path plus encode together, from 8 threads at once.
+        backend = _bare_backend()
+        recorder = _ConcurrencyRecorder()
+        init_calls: list[int] = []
+        init_mu = threading.Lock()
+
+        class _FakeHfConfig:
+            timestamp_token_id = 99
+            timestamp_segment_time = 0.02
+
+        class _FakeAlignerEngine:
+            class llm_engine:  # noqa: N801 — mimics vLLM attribute shape
+                class vllm_config:
+                    class model_config:
+                        hf_config = _FakeHfConfig()
+
+            def encode(self, prompts, pooling_task=""):
+                recorder.generate(prompts)  # overlap accounting only
+                raise _Sentinel()
+
+        class _FakeLLMCls:
+            """Injected as backend._llm_cls: the aligner constructor."""
+
+            def __new__(cls, **kwargs):
+                with init_mu:
+                    init_calls.append(1)
+                time.sleep(0.005)  # widen the init race window
+                return _FakeAlignerEngine()
+
+        backend._llm_cls = _FakeLLMCls
+        backend._gpu_memory_utilization = 0.5
+        errors: list[BaseException] = []
+
+        def run() -> None:
+            try:
+                backend.align_transcript(
+                    audio_path="x",
+                    text="hello world",
+                    audio=np.zeros(160, dtype=np.float32),
+                )
+            except _Sentinel:
+                pass
+            except BaseException as exc:
+                errors.append(exc)
+
+        done = threading.Event()
+
+        def guard() -> None:
+            _hammer(run)
+            done.set()
+
+        watchdog = threading.Thread(target=guard, daemon=True)
+        watchdog.start()
+        # A nested non-reentrant lock shows up as a hang, not an exception.
+        self.assertTrue(done.wait(timeout=10.0), "align_transcript deadlocked")
+        self.assertFalse(errors, errors)
+        self.assertEqual(len(init_calls), 1, "aligner constructed more than once")
+        self.assertEqual(recorder.max_active, 1, "encode not serialized")
+```
+
+(Note: this drives the **production** `_get_forced_aligner` — `_FakeLLMCls` is injected as `backend._llm_cls`, so the real double-checked init, the real `_get_forced_aligner_gpu_memory_utilization` call, and the real config extraction all execute. If `_resolve_forced_aligner_gpu_memory_utilization` reads settings it must run cleanly on the dev box; it does — it is pure config math. Add `backend._gpu_memory_utilization = 0.5` to `_bare_backend` if you prefer it there.)
+
+- [ ] **Step 2: Run — must fail.** `python -m pytest tests/test_qwen3_vllm_locks.py -v`
+Expected: `AttributeError` on the lock attributes and/or `max_active > 1` assertions failing (the fakes bypass `__init__`, so the *first* failures come from the production code not taking the locks the tests hand it — `max_active == 1` assertions fail).
+
+- [ ] **Step 3: Implement in `app/services/asr/qwen3_vllm.py`**
+
+Add `import threading` to the imports. In `__init__`, after `self._timestamp_segment_time = None` (:211):
+
+```python
+        # Per-engine serialization (spec change A, items 1-2).
+        # _llm_lock: the ASR engine AND the shared HF tokenizer — one
+        # critical section, because _decode_stream touches the tokenizer
+        # before generate and Qwen2TokenizerFast raises "Already borrowed"
+        # under concurrent encode.
+        # _aligner_lock: the pooling engine's encode().
+        # _aligner_init_lock: aligner construction ONLY; never held across
+        # encode (three callers of _get_forced_aligner; nesting a
+        # non-reentrant Lock with _aligner_lock would self-deadlock).
+        self._llm_lock = threading.Lock()
+        self._aligner_lock = threading.Lock()
+        self._aligner_init_lock = threading.Lock()
+```
+
+In `_run_generate`, wrap only the generate call (prompt building stays outside):
+
+```python
+        with self._llm_lock:
+            outputs = self._llm.generate(
+                prompts,
+                sampling_params=self._sampling_params,
+                use_tqdm=False,
+            )
+```
+
+In `_decode_stream`, the lock must start **before :450** (tokenizer use), not at :455 — wrap the whole body from `prefix = ""` computation through the `generate` call. Concretely: indent lines 448–467 (from `prefix = ""` through the `[0]` of `generate`) under `with self._llm_lock:`; the post-processing from `generated = str(...)` onward is state-local and stays outside.
+
+In `_get_forced_aligner`, replace the unsynchronized double-checked init (:226–247) with the init-only lock:
+
+```python
+        if self._forced_aligner is None:
+            with self._aligner_init_lock:
+                if self._forced_aligner is None:
+                    ... existing construction body (:227-247) unchanged ...
+        return self._forced_aligner
+```
+
+(Assign `self._forced_aligner` **last** in the construction body, after `_timestamp_token_id`/`_timestamp_segment_time` are set, so a concurrent reader outside the lock never sees a half-initialized aligner. Use a local variable during construction and publish it at the end.)
+
+In `align_transcript`, wrap only the `encode` call (:390–393) with the engine lock — init already happened at :387 outside any encode-scoped lock, so no nesting:
+
+```python
+        with self._aligner_lock:
+            outputs = aligner.encode(
+                [{"prompt": prompt, "multi_modal_data": {"audio": audio_array}}],
+                pooling_task="token_classify",
+            )
+```
+
+- [ ] **Step 4: Run — must pass.** `python -m pytest tests/test_qwen3_vllm_locks.py -v`, then `python -m pytest tests/ -v` (no regressions).
+
+---
+
+### Task 4: Wire the orphan VAD inference lock [LOCAL]
+
+Implements Spec "The changes → A", scope item **3** and "Bottleneck 3": `get_vad_inference_lock()` (`app/services/asr/engines/global_models.py:71`) has zero callers; `audio_splitter.py:102` calls the shared FunASR VAD model unguarded. A makes this path concurrently reachable.
+
+**Files:**
+- Modify: `app/utils/audio_splitter.py:93-102` (`get_vad_segments`)
+- Test: `tests/test_vad_inference_lock.py`
+
+**Interfaces:**
+- Consumes: `get_vad_inference_lock()` from `app.services.asr.engines` (re-exported; verify the re-export exists in `app/services/asr/engines/__init__.py` — `get_global_vad_model` is already imported from there at `audio_splitter.py:94`; if `get_vad_inference_lock` is not re-exported, add it to that `__init__.py`'s imports/`__all__`).
+
+- [ ] **Step 1: Write the failing test**
+
+```python
+# tests/test_vad_inference_lock.py
+from __future__ import annotations
+
+import threading
+import time
+import unittest
+from unittest import mock
+
+
+class _RecordingVadModel:
+    def __init__(self) -> None:
+        self._mu = threading.Lock()
+        self.active = 0
+        self.max_active = 0
+
+    def generate(self, input, cache):
+        with self._mu:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        time.sleep(0.01)
+        with self._mu:
+            self.active -= 1
+        return [{"value": [[0, 1000]]}]
+
+
+class VadInferenceLockTest(unittest.TestCase):
+    def test_concurrent_get_vad_segments_serialized(self) -> None:
+        from app.utils.audio_splitter import AudioSplitter
+
+        model = _RecordingVadModel()
+        splitter = AudioSplitter(device="cpu")
+        with mock.patch(
+            "app.services.asr.engines.get_global_vad_model", return_value=model
+        ):
+            threads = [
+                threading.Thread(target=splitter.get_vad_segments, args=("/fake.wav",))
+                for _ in range(8)
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        self.assertEqual(model.max_active, 1)
+```
+
+(If `AudioSplitter(device="cpu")` needs other constructor args, read `app/utils/audio_splitter.py`'s `__init__` and supply them; the patch target must match the import site inside `get_vad_segments` — it imports `from ..services.asr.engines import get_global_vad_model` *inside the method*, so patch `app.services.asr.engines.get_global_vad_model` as shown.)
+
+- [ ] **Step 2: Run — must fail** with `max_active > 1`. `python -m pytest tests/test_vad_inference_lock.py -v`
+
+- [ ] **Step 3: Implement** in `app/utils/audio_splitter.py` — change the method-local import at :94 and the call at :102:
+
+```python
+            from ..services.asr.engines import get_global_vad_model
+            from ..services.asr.engines.global_models import get_vad_inference_lock
+            ...
+            with get_vad_inference_lock():
+                result = vad_model.generate(input=audio_path, cache={})
+```
+
+(This mirrors the existing PUNC pattern at `websocket_asr.py:723`. Spec caveat noted: if VAD `generate` with fresh `cache={}` is someday proven thread-safe the lock can be dropped, but the default is to guard.)
+
+- [ ] **Step 4: Run — must pass.** Then full suite.
+
+---
+
+### Task 5: Guard the wetext ITN singleton [LOCAL]
+
+Implements Spec "The changes → A", scope item **3b**: `_wetext_normalizer` (`app/utils/text_processing.py:12-29`) has an unsynchronized double-checked init and no call guard; on the default offline path via `enable_itn=True` → `normalize_asr_text` (`qwen3_vllm.py:289,301,348`); no warmup masks it. Guard both init and `.normalize()` (thread safety of the FST unproven).
+
+**Files:**
+- Modify: `app/utils/text_processing.py`
+- Test: `tests/test_itn_thread_safety.py`
+
+**Interfaces:**
+- Produces: module-level `_wetext_lock = threading.Lock()` guarding both `_get_normalizer()` construction and the `normalizer.normalize(text)` call in `apply_itn_to_text`. Public API (`apply_itn_to_text`, `normalize_asr_text`) unchanged.
+
+- [ ] **Step 1: Write the failing test**
+
+```python
+# tests/test_itn_thread_safety.py
+from __future__ import annotations
+
+import threading
+import time
+import unittest
+from unittest import mock
+
+
+class _RecordingNormalizer:
+    def __init__(self) -> None:
+        self._mu = threading.Lock()
+        self.active = 0
+        self.max_active = 0
+
+    def normalize(self, text: str) -> str:
+        with self._mu:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        time.sleep(0.005)
+        with self._mu:
+            self.active -= 1
+        return text
+
+
+class ItnThreadSafetyTest(unittest.TestCase):
+    def test_single_init_and_serialized_normalize_under_contention(self) -> None:
+        import app.utils.text_processing as tp
+
+        constructed: list[_RecordingNormalizer] = []
+
+        class _FakeNormalizerCls:
+            def __new__(cls, lang="zh", operator="itn"):
+                time.sleep(0.005)  # widen the init race window
+                instance = _RecordingNormalizer()
+                constructed.append(instance)
+                return instance
+
+        fake_wetext = mock.MagicMock()
+        fake_wetext.Normalizer = _FakeNormalizerCls
+
+        with mock.patch.dict("sys.modules", {"wetext": fake_wetext}):
+            tp._wetext_normalizer = None  # reset the singleton
+            try:
+                threads = [
+                    threading.Thread(target=tp.apply_itn_to_text, args=("一百二十三",))
+                    for _ in range(8)
+                ]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join()
+            finally:
+                tp._wetext_normalizer = None
+
+        self.assertEqual(len(constructed), 1, "normalizer constructed more than once")
+        self.assertEqual(constructed[0].max_active, 1, "normalize() not serialized")
+```
+
+- [ ] **Step 2: Run — must fail** (duplicate construction and/or `max_active > 1`; note `apply_itn_to_text` swallows exceptions, so assert on the recorders, as above — not on raised errors).
+
+- [ ] **Step 3: Implement** in `app/utils/text_processing.py`:
+
+```python
+import logging
+import threading
+
+logger = logging.getLogger(__name__)
+
+_wetext_normalizer = None
+_wetext_lock = threading.Lock()  # guards init AND normalize(): FST thread safety unproven
+
+
+def _get_normalizer():
+    """获取wetext标准化器实例（单例模式，caller must hold _wetext_lock）"""
+    global _wetext_normalizer
+    if _wetext_normalizer is None:
+        try:
+            from wetext import Normalizer
+            _wetext_normalizer = Normalizer(lang="zh", operator="itn")
+            logger.info("WeText ITN模块初始化成功")
+        except ImportError as e:
+            logger.error(f"导入wetext失败: {e}")
+            raise ImportError("请安装wetext库: pip install wetext")
+        except Exception as e:
+            logger.error(f"初始化wetext失败: {e}")
+            raise
+    return _wetext_normalizer
+```
+
+and in `apply_itn_to_text`, replace the two lines at :47–48 with:
+
+```python
+        with _wetext_lock:
+            normalizer = _get_normalizer()
+            result = normalizer.normalize(text)
+```
+
+(One lock for init + call keeps it simple and cannot nest — `_get_normalizer` is only called with the lock held; grep first to confirm `_get_normalizer` has no other callers: `grep -rn "_get_normalizer" app/ tests/`.)
+
+- [ ] **Step 4: Run — must pass.** Then full suite.
+
+- [ ] **Step 5: Note for Task 9** — the H100 regression test for ITN must use the **mixed websocket + offline** shape; websocket-only ITN calls run on the event-loop thread and can never race each other (Spec item 3b, r7 changelog).
+
+---
+
+### Task 6: Remove the router-level lock; update `tests/test_runtime_router.py` [LOCAL] — LAST of the A tasks
+
+Implements Spec "The changes → A" bullets 1–2 (delete `_vllm_offline_locks`; the backend locks from Task 3 take over) and the Success-criteria requirement that `tests/test_runtime_router.py:59` (`engine.max_active == 1`) be updated — it encodes exactly the serialization A removes. **Do not start until Tasks 3, 4, 5, 7, 8 are done.**
+
+**Files:**
+- Modify: `app/services/asr/runtime/router.py:82,196-202`
+- Modify: `tests/test_runtime_router.py`
+
+**Interfaces:**
+- Consumes: Task 3's backend locks (mixing protection), Task 4/5 guards (accidental-protection sites), Task 7's admission changes.
+- Produces: `run_offline` with no vLLM special-case lock; offline concurrency bounded only by the semaphore (Task 7's value).
+
+- [ ] **Step 1: Rewrite the router test first (TDD — the new contract)**
+
+Replace `test_vllm_offline_requests_do_not_overlap` in `tests/test_runtime_router.py` with:
+
+```python
+    async def test_vllm_offline_requests_overlap_up_to_semaphore(self) -> None:
+        engine = _StatefulEngine()
+        router = RuntimeRouter()
+        semaphore = asyncio.Semaphore(4)
+        router._resolve_family = lambda _model_id: RuntimeFamily.QWEN_VLLM  # type: ignore[method-assign]
+        router._get_shared_engine = lambda _family, _model_id: (  # type: ignore[method-assign]
+            engine,
+            semaphore,
+        )
+
+        requests = [
+            OfflineASRRequest(
+                model_id="qwen3-asr-test",
+                audio_path=f"request-{index}",
+            )
+            for index in range(8)
+        ]
+        results = await asyncio.gather(
+            *(router.run_offline(request) for request in requests)
+        )
+
+        # The router no longer serializes; the semaphore is the only bound.
+        self.assertGreater(engine.max_active, 1)
+        self.assertLessEqual(engine.max_active, 4)
+        self.assertEqual(len(results), 8)
+```
+
+Drop the `result.text == request.audio_path` assertion — `_StatefulEngine.current_audio_path` is a deliberate shared-state race detector that the *router* lock used to hide; positional integrity under concurrency is the backend lock's job (Task 3) and the H100 mixing test's job (Task 9), not the router's. Keep `_StatefulEngine` otherwise as-is.
+
+- [ ] **Step 2: Run — must fail** (`engine.max_active` is 1 while the router lock still exists). `python -m pytest tests/test_runtime_router.py -v`
+
+- [ ] **Step 3: Implement** in `app/services/asr/runtime/router.py`:
+
+Delete line 82 (`self._vllm_offline_locks: dict[str, asyncio.Lock] = {}`) and collapse `run_offline` (:196–202) to:
+
+```python
+    async def run_offline(self, request: OfflineASRRequest) -> ASRFullResult:
+        model_id = self.resolve_model_id(request.model_id)
+        return await self._run_offline(request, model_id)
+```
+
+Confirm nothing else references `_vllm_offline_locks`: `grep -rn "_vllm_offline_locks" app/ tests/` → only the deleted lines.
+
+- [ ] **Step 4: Run — must pass.** Then full suite: `python -m pytest tests/ -v`.
+
+- [ ] **Step 5: Sanity re-read** — with the router lock gone, re-check the A checklist against the diff: backend `_llm_lock` covers `_run_generate` and `_decode_stream` incl. tokenizer (Task 3), aligner encode + init locks (Task 3), VAD lock wired (Task 4), ITN guarded (Task 5), semaphore/executor resolved (Task 7), re-grep clean (Task 8). All six present or A is not landable.
+
+---
+
+### Task 7: Resolve the executor-pool / semaphore interaction [LOCAL]
+
+Implements Spec "The changes → A", scope item **4**, and the Goals item on `_VLLM_SHARED_CONCURRENCY`. Key constraint (Spec r6): Qwen websocket permits are **connection-scoped** (`qwen3_websocket_asr.py:85` acquire → `:388` release at teardown), so 8 idle websocket connections would permanently exhaust the semaphore and block all offline traffic; and after A each admitted offline request holds an executor thread for its whole duration.
+
+**Decision taken by this plan** (the spec's A item 4 sanctions exactly two resolutions: "rescope websocket permits to **per-decode** or size against `offline_requests + concurrent_ws_sessions`"; this plan takes the **per-decode** option — the spec explicitly rejects capping websocket sessions as product-visible):
+
+1. **Websocket *connection* leases stop consuming semaphore permits.** Add `RuntimeRouter.lease_shared_engine(model_id)` that returns a `RuntimeEngineLease` with a no-op release and **no** permit; `qwen3_websocket_asr.py:85` switches to it. An idle connection holds no executor thread and should hold no permit. The FunASR websocket (`websocket_asr.py:179`, `"paraformer-large"`) resolves to the pool path and never touched this semaphore — unchanged.
+2. **Websocket *decodes* acquire a permit from a NEW, SEPARATE per-decode semaphore.** Active decodes are NOT free: each streaming decode is an `await run_sync(engine.streaming_transcribe / finish_streaming_transcribe, ...)` (`qwen3_websocket_asr.py:124,130,334,401,407`) that occupies an executor thread, mostly blocked on Task 3's `_llm_lock`. Without a bound, N concurrent streaming sessions occupy N executor threads and can exhaust the pool. So: add `asyncio.Semaphore(settings.VLLM_WS_DECODE_CONCURRENCY)` (config-driven, default **4**, alongside `VLLM_OFFLINE_CONCURRENCY`), held only for the duration of each decode dispatch — acquired before `run_sync`, released when it returns. Implement as one module-level helper in `qwen3_websocket_asr.py` (`_run_decode(fn, *args)` = `async with _ws_decode_semaphore(): return await run_sync(fn, *args)`, semaphore created lazily at first use) and route all five decode `run_sync` call sites through it.
+   **Why a separate semaphore, not a shared one:** offline permits are held for a whole request (minutes of audio); ws-decode permits are held per chunk-decode (sub-second). Sharing one semaphore would let 4 long offline requests starve every websocket decode for minutes — and a burst of decodes would conversely block offline admission. Two independent bounds, two knobs.
+3. **The old shared semaphore becomes offline-request-scoped admission**, value from config: `VLLM_OFFLINE_CONCURRENCY`, default **4** (was hardcoded 8). Rationale: each admitted offline request holds one executor thread for its full duration after A.
+4. **Executor floor derived from BOTH enforced bounds** — not from an assumed headroom constant. Default workers become `max(4, cpu_count, VLLM_OFFLINE_CONCURRENCY + VLLM_WS_DECODE_CONCURRENCY)`. Every term of the formula is now backed by a mechanism: at most `VLLM_OFFLINE_CONCURRENCY` executor threads are occupied by offline requests (item 3's semaphore) and at most `VLLM_WS_DECODE_CONCURRENCY` by websocket decodes (item 2's semaphore), so under defaults (4+4=8) the pool can always run every admitted **vLLM** job — neither vLLM class can starve the other.
+   **Scope limit — state it, do not overclaim:** the FunASR/paraformer websocket path dispatches its own decodes via `run_sync` (`app/services/websocket_asr.py:642,681,726`) under **no** admission bound, so N realtime paraformer sessions can occupy executor threads outside both semaphores. The floor guarantee therefore holds only across the two vLLM classes. This is pre-existing behavior and outside this spec's scope (the spec treats the FunASR ws path as separate), and paraformer decodes are short per-chunk rather than blocking — but on a small box a burst of paraformer sessions can still delay vLLM ws decodes. Do not claim the pool is starvation-proof in general. Extract the formula as a pure function `compute_default_workers(cpu_count, offline_concurrency, ws_decode_concurrency)` in `executor.py` so it is unit-testable independent of the box (see Step 1). Still overridable via `INFERENCE_THREAD_POOL_SIZE`. (`executor.py` must not import `app.core.config` — keep it env-only, matching its current style: read both knobs via `os.getenv` at module load for the default calculation.)
+
+**Files:**
+- Modify: `app/services/asr/runtime/router.py:21,146,177-194`
+- Modify: `app/core/config.py` (add `VLLM_OFFLINE_CONCURRENCY: int = 4` and `VLLM_WS_DECODE_CONCURRENCY: int = 4` + env overrides, following the `QWEN_RUST_CPU_WORKERS` pattern at :71,:128-130)
+- Modify: `app/core/executor.py:34-35`
+- Modify: `app/services/qwen3_websocket_asr.py` (`:85` lease call; the five decode `run_sync` sites at `:124,:130,:334,:401,:407` routed through `_run_decode`)
+- Test: `tests/test_shared_engine_admission.py`
+
+**Interfaces:**
+- Produces: `RuntimeRouter.lease_shared_engine(self, model_id: Optional[str] = None) -> RuntimeEngineLease` (no permit); offline semaphore value `settings.VLLM_OFFLINE_CONCURRENCY`; ws-decode semaphore `settings.VLLM_WS_DECODE_CONCURRENCY` wrapped by `qwen3_websocket_asr._run_decode`; executor pure function `compute_default_workers(cpu_count, offline_concurrency, ws_decode_concurrency) -> int` returning `max(4, cpu_count, offline_concurrency + ws_decode_concurrency)`, with `_DEFAULT_WORKERS = compute_default_workers(os.cpu_count() or 4, int(os.getenv("VLLM_OFFLINE_CONCURRENCY", "4")), int(os.getenv("VLLM_WS_DECODE_CONCURRENCY", "4")))`.
+- Consumed by: Task 6's test (semaphore bound), Task 9's H100 scripts.
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+# tests/test_shared_engine_admission.py
+from __future__ import annotations
+
+import asyncio
+import unittest
+
+from app.services.asr.runtime.router import (
+    RuntimeFamily,
+    RuntimeRouter,
+    _VLLM_SHARED_CONCURRENCY,  # noqa: F401 — removed in this task; see step 3
+)
+
+
+class SharedEngineAdmissionTest(unittest.IsolatedAsyncioTestCase):
+    def _router_with_fake_shared_engine(self):
+        router = RuntimeRouter()
+        engine = object()
+        semaphore = asyncio.Semaphore(2)
+        router._resolve_family = lambda _m: RuntimeFamily.QWEN_VLLM  # type: ignore[method-assign]
+        router._get_shared_engine = lambda _f, _m: (engine, semaphore)  # type: ignore[method-assign]
+        return router, engine, semaphore
+
+    async def test_websocket_lease_consumes_no_permit(self) -> None:
+        router, engine, semaphore = self._router_with_fake_shared_engine()
+        lease = await router.lease_shared_engine("qwen3-asr-test")
+        self.assertIs(lease.engine, engine)
+        self.assertEqual(semaphore._value, 2)  # untouched
+        await lease.close()
+        self.assertEqual(semaphore._value, 2)  # close is a no-op on permits
+
+    async def test_offline_lease_still_consumes_permit(self) -> None:
+        router, _engine, semaphore = self._router_with_fake_shared_engine()
+        lease = await router.acquire_engine("qwen3-asr-test")
+        self.assertEqual(semaphore._value, 1)
+        await lease.close()
+        self.assertEqual(semaphore._value, 2)
+
+    def test_semaphore_values_come_from_settings(self) -> None:
+        # Assert the class defaults and the env-override mechanism, NOT the
+        # live singleton's values — a runner with VLLM_*_CONCURRENCY exported
+        # would otherwise fail this spuriously.
+        from app.core.config import Settings
+
+        self.assertEqual(Settings.VLLM_OFFLINE_CONCURRENCY, 4)
+        self.assertEqual(Settings.VLLM_WS_DECODE_CONCURRENCY, 4)
+
+        with mock.patch.dict(
+            os.environ,
+            {"VLLM_OFFLINE_CONCURRENCY": "7", "VLLM_WS_DECODE_CONCURRENCY": "9"},
+        ):
+            s = Settings()
+            self.assertEqual(s.VLLM_OFFLINE_CONCURRENCY, 7)
+            self.assertEqual(s.VLLM_WS_DECODE_CONCURRENCY, 9)
+
+    async def test_ws_decode_dispatch_bounded_by_decode_semaphore(self) -> None:
+        # Item 2's mechanism: at most VLLM_WS_DECODE_CONCURRENCY decode
+        # dispatches in flight, regardless of how many sessions stream.
+        import app.services.qwen3_websocket_asr as ws
+
+        mu = threading.Lock()
+        state = {"active": 0, "max_active": 0}
+
+        def fake_decode() -> None:
+            with mu:
+                state["active"] += 1
+                state["max_active"] = max(state["max_active"], state["active"])
+            time.sleep(0.02)
+            with mu:
+                state["active"] -= 1
+
+        await asyncio.gather(*(ws._run_decode(fake_decode) for _ in range(12)))
+        # Bound assertions, not an exact peak: a slow/loaded executor may never
+        # reach 4 concurrently. The bound is what matters; >1 proves the calls
+        # do overlap, so an accidentally-serializing impl still fails.
+        self.assertLessEqual(state["max_active"], 4)  # VLLM_WS_DECODE_CONCURRENCY default
+        self.assertGreater(state["max_active"], 1)
+
+    def test_executor_default_workers_formula(self) -> None:
+        # Tests the FORMULA via the pure function, not the box's cpu_count —
+        # `_MAX_WORKERS >= 8` would already pass on any >=8-thread machine
+        # and would never exercise the sum term. Fails first with
+        # ImportError: compute_default_workers does not exist yet.
+        from app.core.executor import compute_default_workers
+
+        # sum term dominates on a small box: 4 offline + 4 ws decode
+        self.assertEqual(compute_default_workers(2, 4, 4), 8)
+        # cpu_count dominates on a big box
+        self.assertEqual(compute_default_workers(64, 4, 4), 64)
+        # raised knobs raise the floor with them
+        self.assertEqual(compute_default_workers(2, 16, 8), 24)
+        # absolute floor of 4
+        self.assertEqual(compute_default_workers(1, 1, 1), 4)
+```
+
+(Add `import threading`, `import time` to the test module's imports for the ws-decode test.)
+
+Remove the `_VLLM_SHARED_CONCURRENCY` import line once step 3 deletes the constant — the first failing run uses it to prove the module still has the dead knob.
+
+- [ ] **Step 2: Run — must fail** (`lease_shared_engine` does not exist; no `VLLM_OFFLINE_CONCURRENCY`/`VLLM_WS_DECODE_CONCURRENCY` settings; `_run_decode` does not exist; `compute_default_workers` does not exist — ImportError).
+
+- [ ] **Step 3: Implement**
+
+`app/core/config.py` — next to `QWEN_RUST_CPU_WORKERS` (:71):
+
+```python
+    VLLM_OFFLINE_CONCURRENCY: int = 4
+    VLLM_WS_DECODE_CONCURRENCY: int = 4
+```
+
+and in the env-override block (pattern at :128–133):
+
+```python
+        self.VLLM_OFFLINE_CONCURRENCY = int(
+            os.getenv("VLLM_OFFLINE_CONCURRENCY", str(self.VLLM_OFFLINE_CONCURRENCY))
+        )
+        self.VLLM_WS_DECODE_CONCURRENCY = int(
+            os.getenv("VLLM_WS_DECODE_CONCURRENCY", str(self.VLLM_WS_DECODE_CONCURRENCY))
+        )
+```
+
+(Not added to `.env.example` — it is a curated minimal file; Spec "Landed already".)
+
+`app/services/asr/runtime/router.py` — delete `_VLLM_SHARED_CONCURRENCY = 8` (:21); at :146 use `asyncio.Semaphore(settings.VLLM_OFFLINE_CONCURRENCY)`; add below `acquire_engine`:
+
+```python
+    async def lease_shared_engine(
+        self, model_id: Optional[str] = None
+    ) -> RuntimeEngineLease:
+        """Connection-lifetime lease on the shared vLLM engine, WITHOUT an
+        admission permit. Websocket sessions hold their lease for the whole
+        connection (including silence); charging them a permit would let 8
+        idle connections block all offline traffic. Serialization of actual
+        inference is the backend's per-engine locks, not the semaphore.
+        """
+        resolved_model_id = self.resolve_model_id(model_id)
+        family = self._resolve_family(resolved_model_id)
+        if family != RuntimeFamily.QWEN_VLLM:
+            return await self.acquire_engine(model_id)
+        engine, _semaphore = self._get_shared_engine(family, resolved_model_id)
+        return RuntimeEngineLease(engine=engine, release_callback=lambda: None)
+```
+
+`app/services/qwen3_websocket_asr.py` — at `:85`:
+
+```python
+        ctx.engine_lease = await runtime_router.lease_shared_engine(model)
+```
+
+and add the per-decode bound (module level, near the other imports):
+
+```python
+_ws_decode_semaphore: Optional[asyncio.Semaphore] = None
+
+
+def _get_ws_decode_semaphore() -> asyncio.Semaphore:
+    """Per-DECODE admission (spec A item 4, per-decode option). Bounds how
+    many websocket decode dispatches occupy executor threads at once.
+    Connection leases are free (idle sessions hold no thread); each decode
+    is not. Lazy init: created on the event loop at first decode; all
+    acquires happen on the single event-loop thread, so no init race."""
+    global _ws_decode_semaphore
+    if _ws_decode_semaphore is None:
+        from app.core.config import settings
+        _ws_decode_semaphore = asyncio.Semaphore(settings.VLLM_WS_DECODE_CONCURRENCY)
+    return _ws_decode_semaphore
+
+
+async def _run_decode(fn, *args):
+    """All streaming-decode executor dispatches go through here."""
+    async with _get_ws_decode_semaphore():
+        return await run_sync(fn, *args)
+```
+
+then route the five decode dispatches through it — at `:124,:130,:334,:401,:407`, change `await run_sync(engine.streaming_transcribe, ...)` / `await run_sync(engine.finish_streaming_transcribe, ...)` to `await _run_decode(engine.streaming_transcribe, ...)` / `await _run_decode(engine.finish_streaming_transcribe, ...)` (same arguments). Confirm no decode `run_sync` remains: `grep -n "run_sync" app/services/qwen3_websocket_asr.py` → only inside `_run_decode`.
+
+`app/core/executor.py:34` — extract the formula as a testable pure function:
+
+```python
+def compute_default_workers(
+    cpu_count: int, offline_concurrency: int, ws_decode_concurrency: int
+) -> int:
+    """Executor floor derived from BOTH admission bounds (spec A item 4):
+    at most `offline_concurrency` threads held by offline requests and
+    `ws_decode_concurrency` by websocket decodes — each term enforced by
+    its own semaphore — so the pool can always run every admitted job."""
+    return max(4, cpu_count, offline_concurrency + ws_decode_concurrency)
+
+
+_DEFAULT_WORKERS = compute_default_workers(
+    os.cpu_count() or 4,
+    int(os.getenv("VLLM_OFFLINE_CONCURRENCY", "4")),
+    int(os.getenv("VLLM_WS_DECODE_CONCURRENCY", "4")),
+)
+```
+
+(Env reads, not `app.core.config` imports — `executor.py` stays config-free. The env values here must default to the same `4`s as `config.py` so the formula and the semaphores agree when the env is unset.)
+
+- [ ] **Step 4: Run — must pass** (after removing the dead `_VLLM_SHARED_CONCURRENCY` import from the test). Then full suite. Grep for stale references: `grep -rn "_VLLM_SHARED_CONCURRENCY" app/ tests/` → none.
+
+---
+
+### Task 8: Re-grep audit for module-level lazy singletons [LOCAL] — before Task 6
+
+Implements the Spec's Confidence note ("The implementer should re-grep for module-level mutable state on the `transcribe_long_audio` path before landing A" — the audit missed a singleton twice).
+
+**Files:** none modified unless a finding appears.
+
+- [ ] **Step 1: Run the pattern sweeps**
+
+```bash
+cd /home/chandraliuswanto/Desktop/qwen3-asr
+# module-level lazy singletons: `_x = None` + `if _x is None:` initializer
+grep -rn --include='*.py' -E '^_[a-zA-Z0-9_]+(: [^=]+)? = None' app/ | sort
+grep -rn --include='*.py' -E 'if _[a-zA-Z0-9_]+ is None' app/ | sort
+# module-level mutable containers and `global` writers
+grep -rn --include='*.py' -E '^[a-zA-Z_]+ = (\{\}|\[\])' app/
+grep -rn --include='*.py' -E '^\s+global _' app/
+```
+
+- [ ] **Step 2: For each hit, decide reachable-from-`transcribe_long_audio`-or-websocket-decode and guarded-or-not.** Known-good (already guarded or being guarded by this plan): `global_models.py` VAD/PUNC (locked), `text_processing.py` ITN (Task 5), `router.py` `_runtime_router` (locked, :226), `executor.py` `_executor` (event-loop-thread only — `get_executor` is called from `run_sync` on the loop thread, single-threaded; confirm no executor-thread caller before waving it through). Trace anything else to its callers before dismissing it (`Grep` for the accessor name).
+
+- [ ] **Step 3: Outcome.** If a new unguarded singleton on the concurrent path is found: guard it with the Task 5 pattern (module `threading.Lock`, init+call), add a Task-5-style test, and record it in the plan's checklist here. If none: state "re-grep clean, N hits reviewed" in the worker report. Task 6 may not start until this task reports.
+
+---
+
+### Task 9: H100 integration test scripts [LOCAL authoring, H100-ONLY execution]
+
+Implements Spec "Success criteria". These CANNOT run in CI or locally — vLLM is absent and a mocked engine cannot reproduce a scheduler race; a green mocked test would be worthless. Scripts live under `scripts/h100/` and are run manually on the H100 after deploy.
+
+**Files:**
+- Create: `scripts/h100/test_offline_mixing.py`
+- Create: `scripts/h100/test_ws_offline_mixed.py`
+
+**Interfaces:**
+- Consumes: a running service URL (env `ASR_BASE_URL`, default `http://localhost:8000`), a directory of distinct-content test audio files (env `ASR_TEST_AUDIO_DIR`) where each file's expected transcript keyword is encoded in its filename (e.g. `alpha_银行.wav` must transcribe to text containing `银行`).
+
+- [ ] **Step 1: Write `scripts/h100/test_offline_mixing.py`** — the mixing regression test. N≥20 iterations (Spec: "inherently racy — run N≥20, treat as evidence, not proof"); each iteration fires 8 concurrent `POST /v1/audio/transcriptions` (multipart upload, defaults) with distinct audio files and asserts each response's text contains its own file's keyword and none of the other files' keywords. Print a per-iteration PASS/FAIL and a final summary; exit nonzero on any cross-contamination. Include a `--check-detects-bug` note in the docstring: **the run proves nothing unless it FAILS against a build with the Task 3 `_llm_lock` removed** (Spec success criteria) — the runbook is: (1) deploy a build with `with self._llm_lock:` commented out in `_run_generate`, expect FAIL; (2) deploy the real build, expect 20/20 PASS.
+
+- [ ] **Step 2: Write `scripts/h100/test_ws_offline_mixed.py`** — the mixed websocket + offline shape (the ONLY shape that can catch the ITN race — websocket-only never fails, Spec item 3b): drive 4 concurrent websocket sessions (protocol per `app/services/qwen3_websocket_asr.py` — read `_handle` / the API route in `app/api/v1/` for the message framing) streaming distinct audio with `enable_inverse_text_normalization=true`, while 4 offline requests with `enable_itn=true` run concurrently; assert per-channel keyword integrity as in step 1, and record websocket p50/p95 decode latency (time from audio-chunk send to matching partial result) to compare against the Task 2b baseline threshold.
+
+- [ ] **Step 3 [H100-ONLY]: Execution runbook** — after A is deployed: run both scripts (each N≥20 where applicable); run the semaphore-behavior check implicitly via 10 concurrent 5-minute offline requests + `ASR_STAGE_TIMINGS` overlap in logs (compare wall-clock vs `main` per Success criteria — improvement expected, no target multiple); confirm websocket p50/p95 within the threshold agreed at task 2b. Record all numbers.
+
+---
+
+### Self-review notes (performed per the writing-plans skill)
+
+- **Spec coverage (in-scope items):** task 1 → Task 1; task 2 → Tasks 2/2b; A item 1 (main lock incl. tokenizer at `:450`) → Task 3; A item 2 (aligner init-only lock, three callers, no nesting) → Task 3; A item 3 (VAD lock) → Task 4; A item 3b (ITN) → Task 5; A item 4 (executor/semaphore, per-decode websocket rescope, `_VLLM_SHARED_CONCURRENCY` dead-knob resolution) → Task 7; router-lock deletion + `test_runtime_router.py:59` → Task 6; re-grep instruction → Task 8; success-criteria H100 tests (mixing, mixed ws+offline, latency threshold, must-fail-without-guard) → Task 9. B and C: deliberately out of scope, stated up front.
+- **Decision this plan made where the spec offered options (A item 4):** the **per-decode** rescope — no-permit connection leases + a separate per-decode websocket semaphore (`VLLM_WS_DECODE_CONCURRENCY`, default 4) + config-driven offline admission (`VLLM_OFFLINE_CONCURRENCY`, default 4) + an executor floor of `max(4, cpu_count, offline + ws_decode)` in which every term is enforced by one of those two semaphores — rather than sizing permits against connection counts. Grounds: the spec itself calls the admission-limit route "a product-visible regression, not a tuning knob". Two separate semaphores (not one shared) because offline permits are minutes-long and ws-decode permits sub-second; sharing would let either class starve the other.
+- **Types/names consistent:** `_llm_lock`/`_aligner_lock`/`_aligner_init_lock` (Tasks 3, 6, 9), `lease_shared_engine`/`_run_decode` (Tasks 7, 9 consumers), `VLLM_OFFLINE_CONCURRENCY`/`VLLM_WS_DECODE_CONCURRENCY` (Tasks 6 semaphore bound via settings, 7), `compute_default_workers` (Task 7), `format_stage_timings` (Task 2).
