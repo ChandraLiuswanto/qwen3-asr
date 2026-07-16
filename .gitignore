@@ -182,3 +182,7 @@ video/
 
 # subagent-driven-development scratch
 .superpowers/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+.beads-credential-key
