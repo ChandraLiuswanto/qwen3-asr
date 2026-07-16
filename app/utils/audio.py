@@ -191,7 +191,11 @@ def get_timestamp_scale(original_audio_path: str, decoded_duration: float) -> fl
         缩放系数（容器时长 / 解码时长），无差异时返回 1.0
     """
     container_duration = get_container_duration(original_audio_path)
-    if container_duration is None or decoded_duration <= 0:
+    if container_duration is None or container_duration <= 0 or decoded_duration <= 0:
+        # container_duration == 0 happens with broken/streaming-writer WAV
+        # headers (zero RIFF/data-chunk size): the audio decodes fine but the
+        # metadata claims 0s. A 0 scale would zero out every timestamp and the
+        # reported duration, so treat it as "unknown" and skip scaling.
         return 1.0
 
     scale = container_duration / decoded_duration
