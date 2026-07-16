@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
@@ -20,6 +21,27 @@ from app.services.asr.runtime import RuntimeEngineLease, get_runtime_router
 from app.utils.text_processing import normalize_asr_text
 
 logger = logging.getLogger(__name__)
+
+_ws_decode_semaphore: Optional[asyncio.Semaphore] = None
+
+
+def _get_ws_decode_semaphore() -> asyncio.Semaphore:
+    """Per-DECODE admission (spec A item 4, per-decode option). Bounds how
+    many websocket decode dispatches occupy executor threads at once.
+    Connection leases are free (idle sessions hold no thread); each decode
+    is not. Lazy init: created on the event loop at first decode; all
+    acquires happen on the single event-loop thread, so no init race."""
+    global _ws_decode_semaphore
+    if _ws_decode_semaphore is None:
+        from app.core.config import settings
+        _ws_decode_semaphore = asyncio.Semaphore(settings.VLLM_WS_DECODE_CONCURRENCY)
+    return _ws_decode_semaphore
+
+
+async def _run_decode(fn, *args):
+    """All streaming-decode executor dispatches go through here."""
+    async with _get_ws_decode_semaphore():
+        return await run_sync(fn, *args)
 
 
 def _convert_audio(
@@ -82,7 +104,7 @@ class Qwen3ASRService:
         model = validate_realtime_model_id("qwen3-asr")
         logger.info("Using Qwen3-ASR model: %s", model)
 
-        ctx.engine_lease = await runtime_router.acquire_engine(model)
+        ctx.engine_lease = await runtime_router.lease_shared_engine(model)
         engine = ctx.engine_lease.engine
         if not isinstance(engine, Qwen3ASREngine):
             raise RuntimeError("Current model is not Qwen3-ASR")
@@ -104,11 +126,22 @@ class Qwen3ASRService:
             or ctx.silence_samples >= ctx.SILENCE_THRESHOLD
         )
 
-    def _normalize_output_text(self, text: str, ctx: ConnectionContext) -> str:
-        return normalize_asr_text(
-            text,
-            enable_itn=bool(ctx.params.get("enable_inverse_text_normalization", True)),
-        )
+    async def _normalize_output_text(self, text: str, ctx: ConnectionContext) -> str:
+        """Run ITN on an executor thread, never on the event loop.
+
+        normalize_asr_text takes the process-wide blocking _wetext_lock. Called
+        inline from a coroutine that lock would be acquired ON the loop thread,
+        so any executor thread already inside normalize() (or, worse, the
+        multi-second lazy FST init) would freeze the whole server.
+        run_sync, NOT _run_decode: the ws-decode semaphore is GPU admission
+        control for vLLM decode. ITN is CPU-only work that contends on its own
+        lock, so charging it a decode permit would shrink real decode
+        concurrency for no benefit.
+        """
+        enable_itn = bool(ctx.params.get("enable_inverse_text_normalization", True))
+        if not enable_itn or not text:
+            return text
+        return await run_sync(normalize_asr_text, text, enable_itn)
 
     async def _truncate(
         self,
@@ -121,18 +154,18 @@ class Qwen3ASRService:
             engine = await self._ensure_engine(ctx)
 
             if len(ctx.audio_buffer) > 0:
-                ctx.streaming_state = await run_sync(
+                ctx.streaming_state = await _run_decode(
                     engine.streaming_transcribe,
                     ctx.audio_buffer,
                     ctx.streaming_state,
                 )
 
-            ctx.streaming_state = await run_sync(
+            ctx.streaming_state = await _run_decode(
                 engine.finish_streaming_transcribe,
                 ctx.streaming_state,
             )
 
-            segment_text = self._normalize_output_text(
+            segment_text = await self._normalize_output_text(
                 ctx.streaming_state.last_text or "",
                 ctx,
             )
@@ -331,13 +364,13 @@ class Qwen3ASRService:
                         ctx.audio_buffer = ctx.audio_buffer[chunk_size:]
 
                         engine = await self._ensure_engine(ctx)
-                        ctx.streaming_state = await run_sync(
+                        ctx.streaming_state = await _run_decode(
                             engine.streaming_transcribe,
                             chunk,
                             ctx.streaming_state,
                         )
 
-                        current = self._normalize_output_text(
+                        current = await self._normalize_output_text(
                             ctx.streaming_state.last_text or "",
                             ctx,
                         )
@@ -398,18 +431,18 @@ class Qwen3ASRService:
             engine = await self._ensure_engine(ctx)
 
             if len(ctx.audio_buffer) > 0:
-                ctx.streaming_state = await run_sync(
+                ctx.streaming_state = await _run_decode(
                     engine.streaming_transcribe,
                     ctx.audio_buffer,
                     ctx.streaming_state,
                 )
 
-            ctx.streaming_state = await run_sync(
+            ctx.streaming_state = await _run_decode(
                 engine.finish_streaming_transcribe,
                 ctx.streaming_state,
             )
 
-            final = self._normalize_output_text(
+            final = await self._normalize_output_text(
                 ctx.streaming_state.last_text or "", ctx
             )
             if final.strip():

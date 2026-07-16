@@ -58,9 +58,25 @@ if not speaker_segments:
 
 Structural sizing facts: `MAX_SEGMENT_SEC = 60.0` (`config.py:68`) splits 5-minute audio into a handful of segments; `ASR_BATCH_SIZE = 4` (`config.py:64`) means only a few sequential GPU batches per request (`engines/base.py:186`). A batch of 4 short segments is a small workload for an 80GB H100 — there is headroom to pack concurrent requests into those forward passes. How much is a measurement question.
 
-### Root cause — LOAD-BEARING AND NOT YET VERIFIED
+### Root cause — **VERIFIED 2026-07-16**
 
-> **Hypothesis, not established fact.** vLLM is not installed in the dev environment (`pyproject.toml:33` pins `vllm[audio]==0.19.0`, Linux/CUDA-only), so `vllm/entrypoints/llm.py` has not been read. This characterization comes from upstream's documented "`LLM` is not thread-safe" stance and historical `_run_engine` behavior. **Task 1 verifies it. If false, changes A and C must be revised.**
+> **CONFIRMED against the real vLLM 0.19.0 source.** The wheel (`vllm-0.19.0-cp38-abi3-manylinux_2_31_x86_64.whl`) was downloaded from PyPI and its Python source read directly — no GPU is needed to read it, which is why this no longer blocks on H100 access. Evidence verbatim in `.superpowers/sdd/vllm-0.19.0-evidence.txt`.
+>
+> `_run_engine` (`vllm/entrypoints/llm.py:1989`) drains the shared engine and appends **every** finished output, with no filter for the caller's own request IDs:
+>
+> ```python
+> while self.llm_engine.has_unfinished_requests():
+>     step_outputs = self.llm_engine.step()
+>     for output in step_outputs:
+>         if output.finished:
+>             outputs.append(output)
+> ...
+> return sorted(outputs, key=lambda x: int(x.request_id))
+> ```
+>
+> Ownership is unrecoverable by construction: `generate` calls `_run_engine(output_type, use_tqdm=use_tqdm)` (`llm.py:588`) passing **no request IDs**, and `_add_request` (`llm.py:1979`) draws from one shared `self.request_counter` (`llm.py:388`), so concurrent callers interleave IDs. The trailing `sorted(...)` is present exactly as the old caveat predicted and rescues nothing. `encode` (`llm.py:1047` → `_run_engine` at `:1178`) has the identical defect, so the forced aligner was exposed too.
+>
+> **Consequence: the design's premise holds. Change A was necessary, not speculative.**
 
 `Qwen3VLLMBackend` holds one `vllm.LLM` (`app/services/asr/qwen3_vllm.py:201`). Inference dispatches through `loop.run_in_executor` on `max(4, os.cpu_count())` threads (`app/core/executor.py:34-35`), so without the router lock multiple requests call `generate` on different OS threads simultaneously.
 
@@ -180,7 +196,7 @@ Confirmed *not* to need guards: temp files are `NamedTemporaryFile` with unique 
 **C. Async engine for the ASR model.** *(throughput; the largest change)*
 - Eliminates the mixing bug **by construction** — results route by request ID, not list position — so A's main-engine lock disappears rather than moving. Enables continuous batching.
 - **API target unverified.** `AsyncLLMEngine` is a compatibility alias for the v1 engine `vllm.v1.engine.async_llm.AsyncLLM`; the v0 implementation is gone and upstream carries a TODO to remove the proxy. The real target is `AsyncLLM`. Whether the alias still imports at 0.19.0, and whether `multi_modal_data` audio prompts behave identically on the async path, must be confirmed in the deployed image alongside task 1.
-- **C does not address the aligner.** `aligner.encode(..., pooling_task="token_classify")` (`qwen3_vllm.py:390`) is a sync pooling engine. After C it stays behind A's lock permanently, becoming the new global serialization point for `word_timestamps=True` traffic. Whether v1 `AsyncLLM` supports pooling/`encode` with multimodal audio at 0.19.0 is **unknown and must be established before C is scoped.** If it does not, aligner concurrency needs a pool or stays serial — an accepted limitation for non-default traffic.
+- **C does not address the aligner.** `aligner.encode(..., pooling_task="token_classify")` (`qwen3_vllm.py:390`) is a sync pooling engine. After C it stays behind A's lock permanently, becoming the new global serialization point for `word_timestamps=True` traffic. **Resolved 2026-07-16:** v1 `AsyncLLM` (`vllm/v1/engine/async_llm.py:71`) exposes both `async def generate` (`:529`) and `async def encode` (`:777`), and the `vllm/engine/async_llm_engine.py` alias is still present at 0.19.0. So async pooling exists and the aligner **can** migrate under C; whether multimodal audio behaves identically on that path still needs a runtime check on real hardware. If it does not, aligner concurrency needs a pool or stays serial — an accepted limitation for non-default traffic.
 - Blocked on task 1.
 
 ### Ordering
@@ -303,7 +319,7 @@ If ROCm is installed, `torch.cuda.is_available()` may return `True`, making `det
 
 **Architecture:** See Spec sections "Root cause", "The engines and their call sites", and "The changes → A". This plan does not restate them; each task cites the spec item it implements.
 
-**Tech Stack:** Python 3 / FastAPI / vLLM 0.19.0 (H100 only) / `threading.Lock` / `unittest` (`tests/` uses `unittest.IsolatedAsyncioTestCase`, run via `python -m pytest tests/ -v`).
+**Tech Stack:** Python 3 / FastAPI / vLLM 0.19.0 (H100 only) / `threading.Lock` / `unittest` (`tests/` uses `unittest.IsolatedAsyncioTestCase`, run via `DEVICE=cpu .venv/bin/python -m unittest discover -s tests`).
 
 **Deliberately out of scope:** Changes **B** (small-model pooling) and **C** (async engine) are NOT planned here. C is gated on task 1's verdict; B is gated on A landing and task 2's measurements showing where the time goes. Plan them after tasks 1 and 2 have run on the H100.
 
@@ -314,7 +330,9 @@ If ROCm is installed, `torch.cuda.is_available()` may return `True`, making `det
 - TDD wherever a fake-engine unit test can express the behavior; the mixing/race behavior itself is only testable on the H100 (Spec: "Success criteria").
 - No `git pull`/fetch/rebase during the branch; single final commit by the branch owner; **workers commit nothing**.
 - All of A's guards (Tasks 3–7) must land **together** — removing the router lock (Task 6) with any guard missing trades one bug for another (Spec: "A's scope").
-- Run tests with: `python -m pytest tests/ -v` from the repo root.
+- **Environment setup (once):** `./scripts/sync_cpu_env.sh` (documented in README.md "Local Development"; syncs `environments/cpu` into the root `.venv`). The repo's `.venv` may exist but be empty — sync before running anything.
+- Run tests with: `DEVICE=cpu .venv/bin/python -m unittest discover -s tests` from the repo root. **Tests are `unittest`, not pytest** — pytest is not a dependency in either pyproject and adding it would require regenerating both lockfiles, including the unvalidatable CUDA one.
+- **Known pre-existing failure:** `test_runtime_router.test_vllm_offline_requests_do_not_overlap` errors on non-CUDA boxes (`run_offline` calls the unpatched `resolve_model_id`, which raises when no runnable model exists). Baseline is **13/14**. Task 6 rewrites this test and should patch `resolve_model_id` so it is environment-independent.
 
 ### Task dependency graph
 
@@ -466,7 +484,7 @@ class StageTimingLogTest(unittest.TestCase):
 
 - [ ] **Step 3: Run it — must fail** with `ImportError: cannot import name 'format_stage_timings'`.
 
-Run: `python -m pytest tests/test_stage_timings.py -v`
+Run: `DEVICE=cpu .venv/bin/python -m unittest tests.test_stage_timings -v`
 
 - [ ] **Step 4: Implement**
 
@@ -495,7 +513,7 @@ def format_stage_timings(
 
 Inside `transcribe_long_audio`: initialize `import time` accumulators at the top (`_t_total = time.perf_counter()`, `diarization_s = vad_split_s = inference_s = 0.0`, `batches = 0`); wrap the diarizer call, the `AudioSplitter.split_audio_file` call, and each inference batch (the loop at ~:186 — accumulate into `inference_s` and increment `batches`) with `t0 = time.perf_counter()` / `stage_s += time.perf_counter() - t0`. **Do NOT attempt to time alignment separately** — it happens inside the backend's `transcribe_batch` per segment (`qwen3_vllm.py:352`) and is not observable from `base.py`; pass `alignment_s=0.0` always (see the Interfaces limitation above — `inference_s` includes alignment when `word_timestamps=True`). Just before returning, emit `logger.info(format_stage_timings(task_id=str(task_id or ""), total_s=time.perf_counter() - _t_total, ..., alignment_s=0.0))`. Do not change any control flow.
 
-- [ ] **Step 5: Run the test — must pass.** Then run the full suite: `python -m pytest tests/ -v` — no regressions.
+- [ ] **Step 5: Run the test — must pass.** Then run the full suite: `DEVICE=cpu .venv/bin/python -m unittest discover -s tests` — no regressions.
 
 - [ ] **Step 6 [H100-ONLY]: Measurement runbook** — on the H100, after deploy: submit 1, then 10 concurrent, 5-minute-audio `POST /v1/audio/transcriptions` requests (defaults: diarization on, no word timestamps); grep the service log for `ASR_STAGE_TIMINGS`; compute per-stage shares and p50/p95 websocket decode latency baseline (the threshold Spec "Risks → Websocket latency" demands). These numbers gate B and C scoping. Record them; do not extrapolate from them locally.
 
@@ -746,7 +764,7 @@ class AlignerLockTest(unittest.TestCase):
 
 (Note: this drives the **production** `_get_forced_aligner` — `_FakeLLMCls` is injected as `backend._llm_cls`, so the real double-checked init, the real `_get_forced_aligner_gpu_memory_utilization` call, and the real config extraction all execute. If `_resolve_forced_aligner_gpu_memory_utilization` reads settings it must run cleanly on the dev box; it does — it is pure config math. Add `backend._gpu_memory_utilization = 0.5` to `_bare_backend` if you prefer it there.)
 
-- [ ] **Step 2: Run — must fail.** `python -m pytest tests/test_qwen3_vllm_locks.py -v`
+- [ ] **Step 2: Run — must fail.** `DEVICE=cpu .venv/bin/python -m unittest tests.test_qwen3_vllm_locks -v`
 Expected: `AttributeError` on the lock attributes and/or `max_active > 1` assertions failing (the fakes bypass `__init__`, so the *first* failures come from the production code not taking the locks the tests hand it — `max_active == 1` assertions fail).
 
 - [ ] **Step 3: Implement in `app/services/asr/qwen3_vllm.py`**
@@ -803,7 +821,7 @@ In `align_transcript`, wrap only the `encode` call (:390–393) with the engine 
             )
 ```
 
-- [ ] **Step 4: Run — must pass.** `python -m pytest tests/test_qwen3_vllm_locks.py -v`, then `python -m pytest tests/ -v` (no regressions).
+- [ ] **Step 4: Run — must pass.** `DEVICE=cpu .venv/bin/python -m unittest tests.test_qwen3_vllm_locks -v`, then `DEVICE=cpu .venv/bin/python -m unittest discover -s tests` (no regressions).
 
 ---
 
@@ -868,7 +886,7 @@ class VadInferenceLockTest(unittest.TestCase):
 
 (If `AudioSplitter(device="cpu")` needs other constructor args, read `app/utils/audio_splitter.py`'s `__init__` and supply them; the patch target must match the import site inside `get_vad_segments` — it imports `from ..services.asr.engines import get_global_vad_model` *inside the method*, so patch `app.services.asr.engines.get_global_vad_model` as shown.)
 
-- [ ] **Step 2: Run — must fail** with `max_active > 1`. `python -m pytest tests/test_vad_inference_lock.py -v`
+- [ ] **Step 2: Run — must fail** with `max_active > 1`. `DEVICE=cpu .venv/bin/python -m unittest tests.test_vad_inference_lock -v`
 
 - [ ] **Step 3: Implement** in `app/utils/audio_splitter.py` — change the method-local import at :94 and the call at :102:
 
@@ -1052,7 +1070,7 @@ Replace `test_vllm_offline_requests_do_not_overlap` in `tests/test_runtime_route
 
 Drop the `result.text == request.audio_path` assertion — `_StatefulEngine.current_audio_path` is a deliberate shared-state race detector that the *router* lock used to hide; positional integrity under concurrency is the backend lock's job (Task 3) and the H100 mixing test's job (Task 9), not the router's. Keep `_StatefulEngine` otherwise as-is.
 
-- [ ] **Step 2: Run — must fail** (`engine.max_active` is 1 while the router lock still exists). `python -m pytest tests/test_runtime_router.py -v`
+- [ ] **Step 2: Run — must fail** (`engine.max_active` is 1 while the router lock still exists). `DEVICE=cpu .venv/bin/python -m unittest tests.test_runtime_router -v`
 
 - [ ] **Step 3: Implement** in `app/services/asr/runtime/router.py`:
 
@@ -1066,7 +1084,7 @@ Delete line 82 (`self._vllm_offline_locks: dict[str, asyncio.Lock] = {}`) and co
 
 Confirm nothing else references `_vllm_offline_locks`: `grep -rn "_vllm_offline_locks" app/ tests/` → only the deleted lines.
 
-- [ ] **Step 4: Run — must pass.** Then full suite: `python -m pytest tests/ -v`.
+- [ ] **Step 4: Run — must pass.** Then full suite: `DEVICE=cpu .venv/bin/python -m unittest discover -s tests`.
 
 - [ ] **Step 5: Sanity re-read** — with the router lock gone, re-check the A checklist against the diff: backend `_llm_lock` covers `_run_generate` and `_decode_stream` incl. tokenizer (Task 3), aligner encode + init locks (Task 3), VAD lock wired (Task 4), ITN guarded (Task 5), semaphore/executor resolved (Task 7), re-grep clean (Task 8). All six present or A is not landable.
 

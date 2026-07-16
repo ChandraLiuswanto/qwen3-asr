@@ -851,7 +851,10 @@ class AliyunWebSocketASRService:
     ):
         if enable_itn and result:
             logger.debug(f"[{task_id}] 应用ITN: {result}")
-            result = apply_itn_to_text(result)
+            # run_sync, not a direct call: apply_itn_to_text takes the blocking
+            # process-wide _wetext_lock, which must never be acquired on the
+            # event loop thread or a worker holding it freezes the server.
+            result = await run_sync(apply_itn_to_text, result)
             logger.debug(f"[{task_id}] ITN结果: {result}")
 
         await self._send_event(

@@ -19,6 +19,32 @@ from app.utils.audio import get_audio_duration
 logger = logging.getLogger(__name__)
 
 
+def format_stage_timings(
+    *,
+    task_id: str,
+    total_s: float,
+    diarization_s: float,
+    vad_split_s: float,
+    inference_s: float,
+    alignment_s: float,
+    segments: int,
+    batches: int,
+    status: str = "success",
+) -> str:
+    # status is APPENDED last, after batches, and defaults to "success": the
+    # existing field order and formatting are a parsed contract (a runbook
+    # reads these lines), so every field that was here before stays in place
+    # and keeps its position. Consumers that split on whitespace/key=value
+    # simply gain a trailing key they may ignore.
+    return (
+        "ASR_STAGE_TIMINGS "
+        f"task_id={task_id} total_s={total_s:.3f} "
+        f"diarization_s={diarization_s:.3f} vad_split_s={vad_split_s:.3f} "
+        f"inference_s={inference_s:.3f} alignment_s={alignment_s:.3f} "
+        f"segments={segments} batches={batches} status={status}"
+    )
+
+
 @dataclass
 class WordToken:
     """字词级时间戳信息"""
@@ -131,6 +157,14 @@ class BaseASREngine(ABC):
 
         # 开始性能计时
         start_time = time.time()
+        _t_total = time.perf_counter()
+        diarization_s = 0.0
+        vad_split_s = 0.0
+        inference_s = 0.0
+        batches = 0
+        # Bound before the try so the error path can always report a segment
+        # count, however early the failure lands.
+        results: List[ASRSegmentResult] = []
         model_id = getattr(self, 'model_id', 'unknown')
 
         task_prefix = f"[{task_id}] " if task_id else ""
@@ -155,7 +189,9 @@ class BaseASREngine(ABC):
 
                 logger.info(f"{task_prefix}使用说话人分离模式")
                 diarizer = SpeakerDiarizer()
+                _t0 = time.perf_counter()
                 speaker_segments = diarizer.split_audio_by_speakers(audio_path)
+                diarization_s += time.perf_counter() - _t0
 
                 if not speaker_segments:
                     logger.warning(f"{task_prefix}说话人分离未检测到片段，fallback 到 VAD 分割")
@@ -164,7 +200,9 @@ class BaseASREngine(ABC):
                 # 单说话人：使用 VAD 分割
                 logger.info(f"{task_prefix}使用 VAD 分割模式")
                 splitter = AudioSplitter(device=self.device)
+                _t0 = time.perf_counter()
                 audio_segments = splitter.split_audio_file(audio_path)
+                vad_split_s += time.perf_counter() - _t0
 
             # 选择要处理的片段
             segments_to_process = speaker_segments if speaker_segments else audio_segments
@@ -173,7 +211,7 @@ class BaseASREngine(ABC):
 
             logger.info(f"{task_prefix}音频已分割为 {len(segments_to_process)} 段")
 
-            results: List[ASRSegmentResult] = []
+            results = []
             all_texts: List[str] = []
 
             # 使用批处理推理
@@ -195,6 +233,7 @@ class BaseASREngine(ABC):
 
                 try:
                     # 批量推理，支持时间戳
+                    _t0 = time.perf_counter()
                     batch_results = self._transcribe_batch(
                         segments=batch_segments,
                         hotwords=hotwords,
@@ -204,6 +243,8 @@ class BaseASREngine(ABC):
                         word_timestamps=word_timestamps,
                         language=language,
                     )
+                    inference_s += time.perf_counter() - _t0
+                    batches += 1
 
                     for seg, result in zip(batch_segments, batch_results):
                         if result and result.text:
@@ -275,6 +316,23 @@ class BaseASREngine(ABC):
                 word_timestamps=word_timestamps,
             )
 
+            logger.info(
+                format_stage_timings(
+                    task_id=str(task_id or ""),
+                    total_s=time.perf_counter() - _t_total,
+                    diarization_s=diarization_s,
+                    vad_split_s=vad_split_s,
+                    inference_s=inference_s,
+                    # Permanently 0.0, not an oversight: align_transcript runs per
+                    # segment inside the backend's transcribe_batch, interleaved
+                    # within each batch call, so this loop cannot isolate it.
+                    # inference_s therefore includes alignment when word_timestamps=True.
+                    alignment_s=0.0,
+                    segments=len(results),
+                    batches=batches,
+                )
+            )
+
             return ASRFullResult(
                 text=full_text,
                 segments=results,
@@ -298,6 +356,24 @@ class BaseASREngine(ABC):
                 model_id=model_id,
                 status="error",
                 error=str(e),
+            )
+
+            # Emit stage timings on the failure path too. Sampling only
+            # successes biases the measurements toward the fast cases and hides
+            # exactly the slow, timing-out tail these numbers exist to find.
+            logger.info(
+                format_stage_timings(
+                    task_id=str(task_id or ""),
+                    total_s=time.perf_counter() - _t_total,
+                    diarization_s=diarization_s,
+                    vad_split_s=vad_split_s,
+                    inference_s=inference_s,
+                    # See the success path: alignment is never isolable here.
+                    alignment_s=0.0,
+                    segments=len(results),
+                    batches=batches,
+                    status="error",
+                )
             )
 
             logger.error(f"长音频识别失败: {e}")

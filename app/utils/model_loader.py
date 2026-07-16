@@ -402,6 +402,7 @@ def preload_models() -> dict[str, Any]:
         "punc_model": {"loaded": False, "error": None},
         "punc_realtime_model": {"loaded": False, "error": None},
         "speaker_diarization_model": {"loaded": False, "error": None},
+        "itn_normalizer": {"loaded": False, "error": None},
     }
 
     from ..core.config import settings
@@ -440,7 +441,7 @@ def preload_models() -> dict[str, Any]:
     # Check whether paraformer-only support models should be loaded.
     paraformer_enabled = "paraformer-large" in models_to_load
 
-    total_steps = len(models_to_load) + 2
+    total_steps = len(models_to_load) + 3
     if paraformer_enabled:
         total_steps += 2
 
@@ -527,16 +528,43 @@ def preload_models() -> dict[str, Any]:
             logger.error("说话人分离模型(CAM++)加载失败: %s", e)
         progress.advance("已完成说话人分离模型(CAM++)")
 
+        # 6. Preload the ITN normalizer (wetext).
+        # Its constructor loads FSTs for seconds while holding a global lock
+        # that every ITN caller contends on; paying that at boot keeps the
+        # first request from stalling all the others behind it.
+        progress.update("加载逆文本标准化模型(ITN)")
+        try:
+            from .text_processing import warmup_itn
+
+            warmup_itn()
+            result["itn_normalizer"]["loaded"] = True
+        except Exception as e:
+            result["itn_normalizer"]["error"] = str(e)
+            logger.error("逆文本标准化模型(ITN)预热失败: %s", e)
+        progress.advance("已完成逆文本标准化模型(ITN)")
+
     loaded_asr_count = sum(1 for status in result["asr_models"].values() if status["loaded"])
     total_asr_count = len(result["asr_models"])
     extra_loaded = sum(
         1
-        for key in ("vad_model", "punc_model", "punc_realtime_model", "speaker_diarization_model")
+        for key in (
+            "vad_model",
+            "punc_model",
+            "punc_realtime_model",
+            "speaker_diarization_model",
+            "itn_normalizer",
+        )
         if result[key]["loaded"]
     )
     extra_failed = sum(
         1
-        for key in ("vad_model", "punc_model", "punc_realtime_model", "speaker_diarization_model")
+        for key in (
+            "vad_model",
+            "punc_model",
+            "punc_realtime_model",
+            "speaker_diarization_model",
+            "itn_normalizer",
+        )
         if result[key]["error"]
     )
     logger.info(

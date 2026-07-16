@@ -64,6 +64,10 @@ class _FakeRuntimeRouter:
         assert model_id == "qwen3-asr-0.6b"
         return _FakeLease(self._engine)
 
+    async def lease_shared_engine(self, model_id: str) -> _FakeLease:
+        assert model_id == "qwen3-asr-0.6b"
+        return _FakeLease(self._engine)
+
 
 class _FakeWebSocket:
     def __init__(self, messages: list[dict[str, object]]):

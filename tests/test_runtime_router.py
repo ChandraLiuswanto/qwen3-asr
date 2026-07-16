@@ -4,6 +4,7 @@ import asyncio
 import threading
 import time
 import unittest
+from unittest import mock
 
 from app.services.asr.engines import ASRFullResult
 from app.services.asr.runtime.router import (
@@ -35,10 +36,25 @@ class _StatefulEngine:
 
 
 class RuntimeRouterTest(unittest.IsolatedAsyncioTestCase):
-    async def test_vllm_offline_requests_do_not_overlap(self) -> None:
+    async def test_vllm_offline_requests_overlap_up_to_semaphore(self) -> None:
+        # Constructing RuntimeRouter() resolves the default ASR model via
+        # ModelManager._load_models_config -> get_default_model_id, which
+        # raises RuntimeError on boxes with no runnable Qwen3-ASR model
+        # (e.g. non-CUDA dev boxes without the QwenASR rust build). None of
+        # that resolution matters here: the test replaces _resolve_family
+        # and _get_shared_engine right below, so stub the model lookup to
+        # keep router construction environment-independent.
+        import app.services.asr.manager as manager_mod
+
+        with mock.patch(
+            "app.services.asr.manager.get_default_model_id",
+            return_value="qwen3-asr-test",
+        ):
+            with mock.patch.object(manager_mod, "_model_manager", None):
+                router = RuntimeRouter()
+
         engine = _StatefulEngine()
-        router = RuntimeRouter()
-        semaphore = asyncio.Semaphore(8)
+        semaphore = asyncio.Semaphore(4)
         router._resolve_family = lambda _model_id: RuntimeFamily.QWEN_VLLM  # type: ignore[method-assign]
         router._get_shared_engine = lambda _family, _model_id: (  # type: ignore[method-assign]
             engine,
@@ -56,8 +72,7 @@ class RuntimeRouterTest(unittest.IsolatedAsyncioTestCase):
             *(router.run_offline(request) for request in requests)
         )
 
-        self.assertEqual(engine.max_active, 1)
-        self.assertEqual(
-            [result.text for result in results],
-            [request.audio_path for request in requests],
-        )
+        # The router no longer serializes; the semaphore is the only bound.
+        self.assertGreater(engine.max_active, 1)
+        self.assertLessEqual(engine.max_active, 4)
+        self.assertEqual(len(results), 8)

@@ -30,8 +30,22 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 # 全局线程池执行器
-# 默认线程数：max(4, CPU核心数)，可通过环境变量覆盖
-_DEFAULT_WORKERS = max(4, os.cpu_count() or 4)
+# 默认线程数：max(4, CPU核心数, offline并发上限 + ws解码并发上限)，可通过环境变量覆盖
+def compute_default_workers(
+    cpu_count: int, offline_concurrency: int, ws_decode_concurrency: int
+) -> int:
+    """Executor floor derived from BOTH admission bounds (spec A item 4):
+    at most `offline_concurrency` threads held by offline requests and
+    `ws_decode_concurrency` by websocket decodes — each term enforced by
+    its own semaphore — so the pool can always run every admitted job."""
+    return max(4, cpu_count, offline_concurrency + ws_decode_concurrency)
+
+
+_DEFAULT_WORKERS = compute_default_workers(
+    os.cpu_count() or 4,
+    int(os.getenv("VLLM_OFFLINE_CONCURRENCY", "4")),
+    int(os.getenv("VLLM_WS_DECODE_CONCURRENCY", "4")),
+)
 _MAX_WORKERS = int(os.getenv("INFERENCE_THREAD_POOL_SIZE", str(_DEFAULT_WORKERS)))
 
 _executor: Optional[ThreadPoolExecutor] = None

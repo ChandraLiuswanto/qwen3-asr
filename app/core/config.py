@@ -70,6 +70,8 @@ class Settings:
     # Runtime 并发配置（按 backend 独立控制）
     QWEN_RUST_CPU_WORKERS: int = 4
     FUNASR_WORKERS: int = 1
+    VLLM_OFFLINE_CONCURRENCY: int = 4
+    VLLM_WS_DECODE_CONCURRENCY: int = 4
 
     def __init__(self):
         """从环境变量读取配置"""
@@ -131,6 +133,37 @@ class Settings:
         self.FUNASR_WORKERS = int(
             os.getenv("FUNASR_WORKERS", str(self.FUNASR_WORKERS))
         )
+        self.VLLM_OFFLINE_CONCURRENCY = self._positive_int_from_env(
+            "VLLM_OFFLINE_CONCURRENCY", self.VLLM_OFFLINE_CONCURRENCY
+        )
+        self.VLLM_WS_DECODE_CONCURRENCY = self._positive_int_from_env(
+            "VLLM_WS_DECODE_CONCURRENCY", self.VLLM_WS_DECODE_CONCURRENCY
+        )
+
+    @staticmethod
+    def _positive_int_from_env(name: str, default: int) -> int:
+        """Read an admission-concurrency env var, rejecting nonsense at boot.
+
+        Fail loudly rather than clamp: these values size asyncio.Semaphores.
+        A 0 makes every request await a permit forever -- no log, no error, no
+        timeout -- and a negative one only raises at the first request, long
+        after the operator who typo'd it stopped watching. Both are
+        indistinguishable from a hang in production. Clamping would instead
+        silently run a configuration nobody asked for, so refuse to boot and
+        say why.
+        """
+        raw = os.getenv(name)
+        if raw is None:
+            return default
+        try:
+            value = int(raw)
+        except ValueError as e:
+            raise ValueError(
+                f"{name} must be an integer >= 1, got {raw!r}"
+            ) from e
+        if value < 1:
+            raise ValueError(f"{name} must be >= 1, got {value}")
+        return value
 
 
     def _parse_size(self, size_str: str) -> int:

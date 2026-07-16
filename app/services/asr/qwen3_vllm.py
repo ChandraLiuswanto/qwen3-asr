@@ -8,6 +8,7 @@ import importlib.util
 import logging
 import os
 import re
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -210,6 +211,22 @@ class Qwen3VLLMBackend:
         self._timestamp_token_id: int | None = None
         self._timestamp_segment_time: float | None = None
 
+        # Per-engine serialization (spec change A, items 1-2).
+        # _llm_lock: the ASR engine AND the shared HF tokenizer — one
+        # critical section, because _decode_stream touches the tokenizer
+        # before generate and Qwen2TokenizerFast raises "Already borrowed"
+        # under concurrent encode.
+        # _aligner_lock: the pooling engine's encode().
+        # _aligner_init_lock: aligner construction ONLY; never held across
+        # encode. Two call sites reach _get_forced_aligner: the warmup path
+        # (line ~270) and align_transcript (line ~405), and align_transcript
+        # calls it and then takes _aligner_lock for encode. Keep these two
+        # locks separate: merging them into one non-reentrant Lock would make
+        # align_transcript self-deadlock.
+        self._llm_lock = threading.Lock()
+        self._aligner_lock = threading.Lock()
+        self._aligner_init_lock = threading.Lock()
+
     def _get_forced_aligner_gpu_memory_utilization(self) -> float:
         configured = _resolve_forced_aligner_gpu_memory_utilization(self._gpu_memory_utilization)
         logger.info(
@@ -224,27 +241,30 @@ class Qwen3VLLMBackend:
             raise RuntimeError("word_timestamps requires a configured forced aligner model")
 
         if self._forced_aligner is None:
-            forced_aligner_gpu_memory_utilization = self._get_forced_aligner_gpu_memory_utilization()
-            logger.info(
-                "Loading Qwen3 forced aligner via official vLLM: %s (gpu_memory_utilization=%s)",
-                self._forced_aligner_path,
-                forced_aligner_gpu_memory_utilization,
-            )
-            self._forced_aligner = self._llm_cls(
-                model=self._forced_aligner_path,
-                runner="pooling",
-                enforce_eager=True,
-                gpu_memory_utilization=forced_aligner_gpu_memory_utilization,
-                hf_overrides={
-                    "architectures": ["Qwen3ASRForcedAlignerForTokenClassification"],
-                },
-            )
-            llm_engine = getattr(self._forced_aligner, "llm_engine", None)
-            if llm_engine is None:
-                raise RuntimeError("Forced aligner did not expose a vLLM engine instance")
-            config = llm_engine.vllm_config.model_config.hf_config
-            self._timestamp_token_id = int(config.timestamp_token_id)
-            self._timestamp_segment_time = float(config.timestamp_segment_time)
+            with self._aligner_init_lock:
+                if self._forced_aligner is None:
+                    forced_aligner_gpu_memory_utilization = self._get_forced_aligner_gpu_memory_utilization()
+                    logger.info(
+                        "Loading Qwen3 forced aligner via official vLLM: %s (gpu_memory_utilization=%s)",
+                        self._forced_aligner_path,
+                        forced_aligner_gpu_memory_utilization,
+                    )
+                    forced_aligner = self._llm_cls(
+                        model=self._forced_aligner_path,
+                        runner="pooling",
+                        enforce_eager=True,
+                        gpu_memory_utilization=forced_aligner_gpu_memory_utilization,
+                        hf_overrides={
+                            "architectures": ["Qwen3ASRForcedAlignerForTokenClassification"],
+                        },
+                    )
+                    llm_engine = getattr(forced_aligner, "llm_engine", None)
+                    if llm_engine is None:
+                        raise RuntimeError("Forced aligner did not expose a vLLM engine instance")
+                    config = llm_engine.vllm_config.model_config.hf_config
+                    self._timestamp_token_id = int(config.timestamp_token_id)
+                    self._timestamp_segment_time = float(config.timestamp_segment_time)
+                    self._forced_aligner = forced_aligner
 
         return self._forced_aligner
 
@@ -265,11 +285,12 @@ class Qwen3VLLMBackend:
                 }
             )
 
-        outputs = self._llm.generate(
-            prompts,
-            sampling_params=self._sampling_params,
-            use_tqdm=False,
-        )
+        with self._llm_lock:
+            outputs = self._llm.generate(
+                prompts,
+                sampling_params=self._sampling_params,
+                use_tqdm=False,
+            )
 
         transcripts: list[_GeneratedTranscript] = []
         for output, (_audio, _context, language) in zip(outputs, audio_items):
@@ -387,10 +408,11 @@ class Qwen3VLLMBackend:
         aligner = self._get_forced_aligner()
         prompt = _build_alignment_prompt(tokens)
         audio_array = audio if audio is not None else _load_audio(audio_path)
-        outputs = aligner.encode(
-            [{"prompt": prompt, "multi_modal_data": {"audio": audio_array}}],
-            pooling_task="token_classify",
-        )
+        with self._aligner_lock:
+            outputs = aligner.encode(
+                [{"prompt": prompt, "multi_modal_data": {"audio": audio_array}}],
+                pooling_task="token_classify",
+            )
         output = outputs[0]
         logits = output.outputs.data
         predictions = logits.argmax(dim=-1) if hasattr(logits, "argmax") else np.argmax(logits, axis=-1)
@@ -445,26 +467,27 @@ class Qwen3VLLMBackend:
         )
 
     def _decode_stream(self, state: VLLMRealtimeState) -> VLLMRealtimeState:
-        prefix = ""
-        if state.chunk_id >= state.unfixed_chunk_num and state.raw_decoded:
-            token_ids = self._tokenizer.encode(state.raw_decoded, add_special_tokens=False)
-            rollback = token_ids[-state.unfixed_token_num:] if state.unfixed_token_num > 0 else []
-            if rollback:
-                prefix = self._tokenizer.decode(rollback, skip_special_tokens=False).replace("\ufffd", "")
+        with self._llm_lock:
+            prefix = ""
+            if state.chunk_id >= state.unfixed_chunk_num and state.raw_decoded:
+                token_ids = self._tokenizer.encode(state.raw_decoded, add_special_tokens=False)
+                rollback = token_ids[-state.unfixed_token_num:] if state.unfixed_token_num > 0 else []
+                if rollback:
+                    prefix = self._tokenizer.decode(rollback, skip_special_tokens=False).replace("\ufffd", "")
 
-        output = self._llm.generate(
-            [
-                {
-                    "prompt": state.prompt_raw + prefix,
-                    "multi_modal_data": {"audio": [state.audio_accum]},
-                }
-            ],
-            sampling_params=self._sampling_params_cls(
-                temperature=0.01,
-                max_tokens=state.max_new_tokens,
-            ),
-            use_tqdm=False,
-        )[0]
+            output = self._llm.generate(
+                [
+                    {
+                        "prompt": state.prompt_raw + prefix,
+                        "multi_modal_data": {"audio": [state.audio_accum]},
+                    }
+                ],
+                sampling_params=self._sampling_params_cls(
+                    temperature=0.01,
+                    max_tokens=state.max_new_tokens,
+                ),
+                use_tqdm=False,
+            )[0]
         generated = str(output.outputs[0].text if output.outputs else "")
         parsed_language, parsed_text = _parse_asr_output(prefix + generated, state.language or None)
         state.raw_decoded = prefix + generated

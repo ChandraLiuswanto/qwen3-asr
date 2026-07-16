@@ -18,9 +18,6 @@ from app.services.asr.manager import get_model_manager
 from app.services.asr.qwenasr_rust import is_qwenasr_rust_available
 from .local_pool import LocalEnginePool
 
-_VLLM_SHARED_CONCURRENCY = 8
-
-
 class RuntimeFamily(str, Enum):
     QWEN_VLLM = "qwen_vllm"
     QWEN_RUST_CPU = "qwen_rust_cpu"
@@ -79,7 +76,6 @@ class RuntimeRouter:
         )
         self._shared_engines: dict[tuple[RuntimeFamily, str], BaseASREngine] = {}
         self._shared_limits: dict[tuple[RuntimeFamily, str], asyncio.Semaphore] = {}
-        self._vllm_offline_locks: dict[str, asyncio.Lock] = {}
         self._pool_lock = threading.Lock()
         self._loaded_model_ids: set[str] = set()
 
@@ -143,7 +139,7 @@ class RuntimeRouter:
                 self._shared_engines[runtime_key] = engine
                 self._loaded_model_ids.add(model_id)
             if semaphore is None:
-                semaphore = asyncio.Semaphore(_VLLM_SHARED_CONCURRENCY)
+                semaphore = asyncio.Semaphore(settings.VLLM_OFFLINE_CONCURRENCY)
                 self._shared_limits[runtime_key] = semaphore
             return engine, semaphore
 
@@ -193,12 +189,24 @@ class RuntimeRouter:
             release_callback=lambda: pool.release(engine),
         )
 
+    async def lease_shared_engine(
+        self, model_id: Optional[str] = None
+    ) -> RuntimeEngineLease:
+        """Connection-lifetime lease on the shared vLLM engine, WITHOUT an
+        admission permit. Websocket sessions hold their lease for the whole
+        connection (including silence); charging them a permit would let 8
+        idle connections block all offline traffic. Serialization of actual
+        inference is the backend's per-engine locks, not the semaphore.
+        """
+        resolved_model_id = self.resolve_model_id(model_id)
+        family = self._resolve_family(resolved_model_id)
+        if family != RuntimeFamily.QWEN_VLLM:
+            return await self.acquire_engine(model_id)
+        engine, _semaphore = self._get_shared_engine(family, resolved_model_id)
+        return RuntimeEngineLease(engine=engine, release_callback=lambda: None)
+
     async def run_offline(self, request: OfflineASRRequest) -> ASRFullResult:
         model_id = self.resolve_model_id(request.model_id)
-        if self._resolve_family(model_id) == RuntimeFamily.QWEN_VLLM:
-            lock = self._vllm_offline_locks.setdefault(model_id, asyncio.Lock())
-            async with lock:
-                return await self._run_offline(request, model_id)
         return await self._run_offline(request, model_id)
 
     async def _run_offline(

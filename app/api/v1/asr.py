@@ -343,7 +343,13 @@ async def health_check(request: Request):
         try:
             runtime_router = get_runtime_router()
             default_model = runtime_router.resolve_model_id(None)
-            async with await runtime_router.acquire_engine(default_model) as engine:
+            # lease_shared_engine, NOT acquire_engine: health only reads
+            # engine.device and runs no inference, so it must not be charged an
+            # offline admission permit. With VLLM_OFFLINE_CONCURRENCY in-flight
+            # transcriptions holding every permit for minutes, acquire_engine
+            # would block the liveness probe until one finished and get the pod
+            # restarted -- killing the very work the permits were granted for.
+            async with await runtime_router.lease_shared_engine(default_model) as engine:
                 model_loaded = True
                 device = engine.device
         except Exception:
