@@ -29,6 +29,7 @@ class OfflineTranscriptionOptions:
     hotwords: str = ""
     enable_speaker_diarization: bool = True
     word_timestamps: bool = False
+    language: Optional[str] = None
     task_id: Optional[str] = None
 
 
@@ -97,6 +98,7 @@ class OfflineTranscriptionService:
                 enable_speaker_diarization=options.enable_speaker_diarization,
                 word_timestamps=options.word_timestamps,
                 timestamp_scale=prepared_audio.timestamp_scale,
+                language=options.language,
                 task_id=options.task_id,
             )
         )

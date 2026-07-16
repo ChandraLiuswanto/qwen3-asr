@@ -474,8 +474,8 @@ async def create_transcription(
     ),
     language: Optional[str] = Form(
         None,
-        description="音频语言代码（ISO-639-1），如 zh/en/ja，不填则自动检测",
-        examples=["zh", "en", "ja"],
+        description="音频语言代码（ISO-639-1）或语言名称，如 zh/en/ja/id/Indonesian，不填则自动检测",
+        examples=["zh", "en", "ja", "id"],
     ),
     # 4. 功能开关
     enable_speaker_diarization: bool = Form(
@@ -492,8 +492,8 @@ async def create_transcription(
         description="输出格式",
         examples=["verbose_json", "json", "text", "srt", "vtt"],
     ),
-    # 6. 兼容性参数（暂不支持）
-    prompt: Optional[str] = Form(None, description="提示文本（暂不支持，保留兼容）"),  # noqa: ARG001
+    # 6. 兼容性参数
+    prompt: Optional[str] = Form(None, description="提示文本，作为命名实体上下文注入转写提示（hotwords）"),
     temperature: Optional[float] = Form(0, description="采样温度（暂不支持，保留兼容）"),  # noqa: ARG001
     timestamp_granularities: Optional[List[str]] = Form(  # noqa: ARG001
         None,
@@ -558,8 +558,10 @@ async def create_transcription(
             prepared_audio,
             OfflineTranscriptionOptions(
                 sample_rate=16000,
+                hotwords=prompt or "",
                 enable_speaker_diarization=enable_speaker_diarization,
                 word_timestamps=word_timestamps,
+                language=language,
             ),
         )
         audio_duration = prepared_audio.duration

@@ -442,6 +442,7 @@ class Qwen3ASREngine(BaseASREngine):
         enable_itn: bool = False,
         sample_rate: int = 16000,
         word_timestamps: bool = False,
+        language: Optional[str] = None,
     ) -> List[ASRSegmentResult]:
         output = [ASRSegmentResult(text="", start_time=0.0, end_time=0.0) for _ in segments]
 
@@ -487,6 +488,7 @@ class Qwen3ASREngine(BaseASREngine):
             vllm_results = self.model.transcribe_batch(
                 [seg.temp_file for _, seg in valid],
                 context=hotwords or "",
+                language=language,
                 word_timestamps=word_timestamps,
                 enable_itn=enable_itn,
             )

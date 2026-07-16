@@ -107,6 +107,7 @@ class BaseASREngine(ABC):
         enable_speaker_diarization: bool = True,
         word_timestamps: bool = False,
         timestamp_scale: float = 1.0,
+        language: Optional[str] = None,
         task_id: Optional[str] = None,
     ) -> ASRFullResult:
         """转录长音频文件（自动分段）
@@ -120,6 +121,7 @@ class BaseASREngine(ABC):
             enable_speaker_diarization: 是否启用说话人分离
             word_timestamps: 是否返回字词级时间戳（仅部分模型支持）
             timestamp_scale: Timestamp correction factor from audio normalization.
+            language: 指定转写语言（如 "id" / "Indonesian"；None 表示自动检测）
             task_id: 任务ID（用于日志追踪）
 
         Returns:
@@ -200,6 +202,7 @@ class BaseASREngine(ABC):
                         enable_itn=enable_itn,
                         sample_rate=sample_rate,
                         word_timestamps=word_timestamps,
+                        language=language,
                     )
 
                     for seg, result in zip(batch_segments, batch_results):
@@ -325,6 +328,7 @@ class BaseASREngine(ABC):
         enable_itn: bool = False,
         sample_rate: int = 16000,
         word_timestamps: bool = False,
+        language: Optional[str] = None,
     ) -> List[ASRSegmentResult]:
         """批量推理多个音频片段
 
@@ -335,6 +339,7 @@ class BaseASREngine(ABC):
             enable_itn: 是否启用 ITN
             sample_rate: 采样率
             word_timestamps: 是否返回字词级时间戳
+            language: 指定转写语言（None 表示自动检测；默认实现不使用）
 
         Returns:
             ASRSegmentResult 列表，与输入片段一一对应

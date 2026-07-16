@@ -39,6 +39,10 @@ _LANGUAGE_ALIASES = {
     "de": "German",
     "es": "Spanish",
     "ru": "Russian",
+    "id": "Indonesian",
+    "ms": "Malay",
+    "th": "Thai",
+    "vi": "Vietnamese",
 }
 
 

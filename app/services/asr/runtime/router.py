@@ -38,6 +38,7 @@ class OfflineASRRequest:
     enable_speaker_diarization: bool = True
     word_timestamps: bool = False
     timestamp_scale: float = 1.0
+    language: Optional[str] = None
     task_id: Optional[str] = None
 
 
@@ -216,6 +217,7 @@ class RuntimeRouter:
                 enable_speaker_diarization=request.enable_speaker_diarization,
                 word_timestamps=request.word_timestamps,
                 timestamp_scale=request.timestamp_scale,
+                language=request.language,
                 task_id=request.task_id,
             )
 

@@ -48,6 +48,12 @@ class ASRQueryParams(BaseModel):
         max_length=512,
     )
 
+    language: Optional[str] = Field(
+        default=None,
+        description="音频语言代码（ISO-639-1）或语言名称，如 zh/en/ja/id/Indonesian，不填则自动检测",
+        max_length=32,
+    )
+
 
 # ============= 响应模型 =============
 
