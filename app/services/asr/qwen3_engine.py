@@ -16,7 +16,7 @@ from .qwenasr_rust import (
     is_qwenasr_rust_available,
 )
 from .qwen3_vllm import Qwen3VLLMBackend, is_vllm_available
-from ...core.exceptions import DefaultServerErrorException
+from ...core.exceptions import APIException, DefaultServerErrorException
 from ...core.config import settings
 from ...utils.text_processing import normalize_asr_text
 
@@ -91,6 +91,8 @@ def _handle_asr_error(operation: str):
         def wrapper(*args, **kwargs):
             try:
                 return func(*args, **kwargs)
+            except APIException:
+                raise
             except Exception as e:
                 logger.error(f"{operation} 失败: {e}")
                 raise DefaultServerErrorException(f"{operation} 失败: {e}")
