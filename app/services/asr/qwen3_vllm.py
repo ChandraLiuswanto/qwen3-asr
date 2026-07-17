@@ -20,6 +20,7 @@ import numpy as np
 from app.infrastructure import resolve_huggingface_snapshot_dir
 from app.utils.text_processing import normalize_asr_text
 
+from ...core.exceptions import InvalidParameterException
 from .engines import ASRRawResult, ASRSegmentResult, WordToken
 
 logger = logging.getLogger(__name__)
@@ -78,7 +79,7 @@ def _normalize_language_name(language: Optional[str]) -> Optional[str]:
         # (qwen_asr normalize_language_name).
         canonical = normalized[:1].upper() + normalized[1:].lower()
     if canonical not in _SUPPORTED_LANGUAGES:
-        raise ValueError(
+        raise InvalidParameterException(
             f"Unsupported language: {language!r} (canonical form {canonical!r}). "
             f"Supported: {sorted(_SUPPORTED_LANGUAGES)}"
         )

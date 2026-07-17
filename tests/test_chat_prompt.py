@@ -19,6 +19,7 @@ from pathlib import Path
 
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
+from app.core.exceptions import InvalidParameterException
 from app.services.asr.qwen3_vllm import (
     Qwen3VLLMBackend,
     _load_chat_template,
@@ -109,7 +110,7 @@ class BuildChatPromptTest(unittest.TestCase):
             context="", language=_normalize_language_name("id")
         )
         self.assertTrue(prompt.endswith("language Indonesian<asr_text>"))
-        with self.assertRaises(ValueError):
+        with self.assertRaises(InvalidParameterException):
             _normalize_language_name("tl")
 
     # -- spec Testing case 10: round-trip against the real template ----------

@@ -10,6 +10,7 @@ raise rather than be injected into the assistant prefill as a guess.
 
 import unittest
 
+from app.core.exceptions import InvalidParameterException
 from app.services.asr.qwen3_vllm import _SUPPORTED_LANGUAGES, _normalize_language_name
 
 
@@ -39,9 +40,10 @@ class NormalizeLanguageNameTest(unittest.TestCase):
     def test_unsupported_language_raises(self) -> None:
         for bad in ("tl", "Klingon", "xx-YY"):
             with self.subTest(bad=bad):
-                with self.assertRaises(ValueError) as ctx:
+                with self.assertRaises(InvalidParameterException) as ctx:
                     _normalize_language_name(bad)
                 self.assertIn(bad, str(ctx.exception))
+                self.assertEqual(ctx.exception.status_code, 40000003)
 
     def test_supported_set_is_upstreams_thirty(self) -> None:
         # Pinned to qwen_asr/inference/utils.py:37 (SUPPORTED_LANGUAGES).
