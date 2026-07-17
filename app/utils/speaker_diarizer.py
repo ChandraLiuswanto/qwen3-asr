@@ -19,11 +19,10 @@ import torch
 
 from ..core.config import settings
 from ..core.exceptions import DefaultServerErrorException
+from ..services.asr.runtime.local_pool import ThreadedEnginePool
 
-# 全局 CAM++ pipeline 缓存（单例）
-_global_diarization_pipeline: Any | None = None
+# 仅用于 _install_empty_cache_guard 的一次性安装（历史上还保护过单例加载）
 _diarization_pipeline_lock = threading.Lock()
-_diarization_inference_semaphore = threading.BoundedSemaphore(1)
 
 # --- torch.cuda.empty_cache guard -------------------------------------------
 # funasr runs `torch.cuda.empty_cache()` after EVERY inference
@@ -42,8 +41,8 @@ def _install_empty_cache_guard() -> None:
     """Wrap torch.cuda.empty_cache once. Idempotent: never nests wrappers.
 
     Acquires `_diarization_pipeline_lock` (non-reentrant). MUST NOT be called
-    while that lock is already held (e.g. from inside the
-    `get_global_diarization_pipeline` critical section) or it will deadlock.
+    while that lock is already held or it will deadlock. (Safe from
+    `_build_diarization_pipeline`: the pool's init lock is a different lock.)
     """
     global _empty_cache_guard_installed, _empty_cache_tls
     with _diarization_pipeline_lock:
@@ -271,41 +270,59 @@ def _enable_batched_sv(
     return pipeline_instance
 
 
-def get_global_diarization_pipeline() -> Any:
-    """获取全局说话人分离 pipeline（懒加载单例）"""
-    global _global_diarization_pipeline
+def _build_diarization_pipeline() -> Any:
+    """Build ONE independent CAM++ pipeline instance (weights + batched SV).
 
-    with _diarization_pipeline_lock:
-        if _global_diarization_pipeline is None:
-            try:
-                from modelscope.utils.constant import Tasks
-                from ..infrastructure.model_utils import resolve_model_path
+    Called by the pool factory under the pool's init lock, so construction is
+    sequential — modelscope `pipeline()` touches global registries and may
+    download on first run; building N concurrently is a race.
 
-                model_id = 'iic/speech_campplus_speaker-diarization_common'
-                model_path = resolve_model_path(model_id)
-                modelscope_device = _resolve_modelscope_device()
+    Each instance is fully independent (own sv/vad/change_locator children,
+    per-instance MethodType patch). funasr mutates shared per-instance state
+    on every call (auto_model.py kwargs, fsmn_vad is_final toggling), so an
+    instance must NEVER be visible to two concurrent requests: the pool
+    checkout is the mutex that replaced _diarization_inference_semaphore.
+    """
+    _install_empty_cache_guard()
+    try:
+        from modelscope.utils.constant import Tasks
+        from ..infrastructure.model_utils import resolve_model_path
 
-                logger.info(
-                    "正在加载 CAM++ 说话人分离模型: {}, device={}",
-                    model_path,
-                    modelscope_device,
-                )
-                _global_diarization_pipeline = _create_modelscope_pipeline(
-                    task=Tasks.speaker_diarization,
-                    model=model_path,
-                    modelscope_device=modelscope_device,
-                )
-                _global_diarization_pipeline = _enable_batched_sv(
-                    _global_diarization_pipeline,
-                    modelscope_device,
-                    max_batch_size=settings.DIARIZATION_SV_BATCH_SIZE,
-                )
-                logger.info("CAM++ 模型加载成功（已启用 batched SV）")
-            except Exception as e:
-                logger.error(f"CAM++ 模型加载失败: {e}")
-                raise DefaultServerErrorException(f"说话人分离模型加载失败: {str(e)}")
+        model_id = 'iic/speech_campplus_speaker-diarization_common'
+        model_path = resolve_model_path(model_id)
+        modelscope_device = _resolve_modelscope_device()
 
-    return _global_diarization_pipeline
+        logger.info(
+            "正在加载 CAM++ 说话人分离模型: {}, device={}",
+            model_path,
+            modelscope_device,
+        )
+        pipeline_instance = _create_modelscope_pipeline(
+            task=Tasks.speaker_diarization,
+            model=model_path,
+            modelscope_device=modelscope_device,
+        )
+        pipeline_instance = _enable_batched_sv(
+            pipeline_instance,
+            modelscope_device,
+            max_batch_size=settings.DIARIZATION_SV_BATCH_SIZE,
+        )
+        logger.info("CAM++ 模型加载成功（已启用 batched SV）")
+        return pipeline_instance
+    except Exception as e:
+        logger.error(f"CAM++ 模型加载失败: {e}")
+        raise DefaultServerErrorException(f"说话人分离模型加载失败: {str(e)}")
+
+
+_diarization_pool: ThreadedEnginePool[Any] = ThreadedEnginePool(
+    settings.DIARIZATION_POOL_SIZE, _build_diarization_pipeline
+)
+
+
+def warmup_diarization_pool() -> int:
+    """Eagerly build all N pipeline instances (startup warmup). Returns N."""
+    _diarization_pool.warmup()
+    return _diarization_pool.size
 
 
 class SpeakerDiarizer:
@@ -336,11 +353,17 @@ class SpeakerDiarizer:
             原始分段列表（未合并）
         """
         try:
-            pipeline = get_global_diarization_pipeline()
-
             logger.info(f"开始说话人分离: {audio_path}")
-            with _diarization_inference_semaphore:
-                result = pipeline(audio_path)
+            # Checkout = per-instance mutex: this instance is ours alone
+            # until release. funasr mutates instance state per call, so the
+            # instance must not be shared; the finally makes leaks impossible
+            # even when the pipeline raises (e.g. "too short" audio).
+            pipeline = _diarization_pool.acquire()
+            try:
+                with _suppress_empty_cache():
+                    result = pipeline(audio_path)
+            finally:
+                _diarization_pool.release(pipeline)
 
             # 解析结果: {'text': [[start, end, speaker_id], ...]}
             # pipeline 返回类型不确定，需要安全地获取 'text' 字段
