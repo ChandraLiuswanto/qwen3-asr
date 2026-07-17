@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import unittest
@@ -10,8 +11,11 @@ from app.infrastructure.model_utils import (
     find_huggingface_snapshot_dir,
     resolve_model_path,
 )
-from app.services.asr.model_capabilities import get_slugged_assets
-from app.utils.download_models import check_all_models
+from app.services.asr.model_capabilities import (
+    get_camplusplus_replacement_paths,
+    get_slugged_assets,
+)
+from app.utils.download_models import check_all_models, fix_camplusplus_config
 from app.utils.model_loader import _build_required_model_integrity_specs
 
 
@@ -352,3 +356,89 @@ class OverridesSkipStartupChecksTest(unittest.TestCase):
 
         self.assertNotIn(_VAD_ID, missing_ids)
         self.assertIn("iic/punc_ct-transformer_zh-cn-common-vocab272727-pytorch", missing_ids)
+
+
+_CAMPP_SV_ID = "damo/speech_campplus_sv_zh-cn_16k-common"
+
+
+class CamppReplacementPathsTest(unittest.TestCase):
+    def setUp(self) -> None:
+        model_paths.reset_override_cache()
+        self.addCleanup(model_paths.reset_override_cache)
+
+    def test_replacement_paths_reflect_override(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = _make_model_dir(temp_dir, "campp-sv")
+            with mock.patch.dict(
+                os.environ, {"MODEL_PATH_CAMPP_SV": model_dir}, clear=True
+            ):
+                replacements = get_camplusplus_replacement_paths()
+
+            self.assertEqual(replacements[_CAMPP_SV_ID], str(Path(model_dir).resolve()))
+
+    def test_replacement_paths_use_cache_without_override(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            replacements = get_camplusplus_replacement_paths()
+
+        self.assertIn(_CAMPP_SV_ID, replacements)
+
+
+class CamppRewriteTargetTest(unittest.TestCase):
+    """Guards spec test 11b and the fail-loud contract on a read-only override."""
+
+    def setUp(self) -> None:
+        model_paths.reset_override_cache()
+        self.addCleanup(model_paths.reset_override_cache)
+
+    def _overridden_campp(self, temp_dir: str) -> dict[str, str]:
+        """Build a diarization override whose config needs a real replacement."""
+        diar_dir = Path(temp_dir) / "diar"
+        diar_dir.mkdir()
+        (diar_dir / "configuration.json").write_text(
+            json.dumps({"model": {"speaker_model": _CAMPP_SV_ID}}), encoding="utf-8"
+        )
+        sv_dir = _make_model_dir(temp_dir, "campp-sv")
+        return {
+            "MODEL_PATH_CAMPP_DIARIZATION": str(diar_dir),
+            "MODEL_PATH_CAMPP_SV": sv_dir,
+        }
+
+    def test_rewrite_targets_the_overridden_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env = self._overridden_campp(temp_dir)
+            with mock.patch.dict(os.environ, env, clear=True):
+                self.assertTrue(fix_camplusplus_config())
+
+            written = json.loads(
+                (Path(env["MODEL_PATH_CAMPP_DIARIZATION"]) / "configuration.json")
+                .read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(
+            written["model"]["speaker_model"],
+            str(Path(env["MODEL_PATH_CAMPP_SV"]).resolve()),
+        )
+
+    def test_readonly_override_raises_when_offline(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env = self._overridden_campp(temp_dir)
+            env["HF_HUB_OFFLINE"] = "1"
+            with mock.patch.dict(os.environ, env, clear=True):
+                with mock.patch(
+                    "app.utils.download_models.json.dump",
+                    side_effect=OSError("read-only file system"),
+                ):
+                    with self.assertRaises(RuntimeError) as ctx:
+                        fix_camplusplus_config()
+
+        self.assertIn("read-only file system", str(ctx.exception))
+
+    def test_readonly_override_only_warns_when_online(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env = self._overridden_campp(temp_dir)
+            with mock.patch.dict(os.environ, env, clear=True):
+                with mock.patch(
+                    "app.utils.download_models.json.dump",
+                    side_effect=OSError("read-only file system"),
+                ):
+                    self.assertFalse(fix_camplusplus_config())

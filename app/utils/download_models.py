@@ -110,9 +110,12 @@ def fix_camplusplus_config() -> bool:
     Returns:
         是否修复成功
     """
+    from app.infrastructure.model_utils import resolve_model_path
+
+    diarization_id = "iic/speech_campplus_speaker-diarization_common"
+
     try:
-        cache_dir = Path(settings.MODELSCOPE_PATH)
-        config_file = cache_dir / "iic/speech_campplus_speaker-diarization_common/configuration.json"
+        config_file = Path(resolve_model_path(diarization_id)) / "configuration.json"
 
         if not config_file.exists():
             return False
@@ -122,7 +125,7 @@ def fix_camplusplus_config() -> bool:
             config = json.load(f)
 
         # Model id to local path replacements.
-        replacements = get_camplusplus_replacement_paths(str(cache_dir))
+        replacements = get_camplusplus_replacement_paths()
 
         # Check whether any replacement is needed.
         modified = False
@@ -137,17 +140,33 @@ def fix_camplusplus_config() -> bool:
                             config["model"][key] = new_value
                             modified = True
 
-        # Write the config file back.
-        if modified:
-            with open(config_file, 'w', encoding='utf-8') as f:
-                json.dump(config, f, indent=4, ensure_ascii=False)
-            return True
-
-        return False
+        if not modified:
+            return False
 
     except Exception as e:
         print(f"⚠️  修复 CAM++ 配置文件失败: {e}")
         return False
+
+    # The write sits outside the catch-all above on purpose: an offline rewrite
+    # failure must be able to abort startup, and that except Exception would
+    # turn the RuntimeError back into a warning.
+    try:
+        with open(config_file, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=4, ensure_ascii=False)
+    except OSError as e:
+        # An override may point at a read-only mount. Offline runs need this
+        # rewrite or diarization reaches for modelscope.cn; online runs can
+        # still fetch, so they only warn.
+        message = (
+            f"Cannot rewrite {config_file} for offline use: {e}. "
+            f"Make the directory writable, or pre-patch the config."
+        )
+        if is_huggingface_offline():
+            raise RuntimeError(message) from e
+        print(f"⚠️  {message}")
+        return False
+
+    return True
 
 
 def download_models(

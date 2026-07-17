@@ -171,12 +171,17 @@ def get_enabled_qwen_huggingface_assets(
     return assets
 
 
-def get_camplusplus_replacement_paths(cache_dir: str) -> dict[str, str]:
-    """Return the CAM++ offline replacement map for local cache paths."""
+def get_camplusplus_replacement_paths() -> dict[str, str]:
+    """Return the CAM++ offline replacement map, honoring MODEL_PATH overrides."""
+    from app.infrastructure.model_utils import resolve_model_path
+
     return {
-        "damo/speech_campplus_sv_zh-cn_16k-common": f"{cache_dir}/damo/speech_campplus_sv_zh-cn_16k-common",
-        "damo/speech_campplus-transformer_scl_zh-cn_16k-common": f"{cache_dir}/damo/speech_campplus-transformer_scl_zh-cn_16k-common",
-        "damo/speech_fsmn_vad_zh-cn-16k-common-pytorch": f"{cache_dir}/damo/speech_fsmn_vad_zh-cn-16k-common-pytorch",
+        model_id: resolve_model_path(model_id)
+        for model_id in (
+            "damo/speech_campplus_sv_zh-cn_16k-common",
+            "damo/speech_campplus-transformer_scl_zh-cn_16k-common",
+            "damo/speech_fsmn_vad_zh-cn-16k-common-pytorch",
+        )
     }
 
 

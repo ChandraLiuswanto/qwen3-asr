@@ -406,8 +406,12 @@ def preload_models() -> dict[str, Any]:
     try:
         from .download_models import fix_camplusplus_config
         fix_camplusplus_config()
+    except RuntimeError:
+        # Offline repair failure is fatal: diarization would silently reach for
+        # modelscope.cn at request time. See fix_camplusplus_config.
+        raise
     except Exception:
-        pass  # Config repair failures should not block startup.
+        pass  # Other config repair failures should not block startup.
 
     result: dict[str, Any] = {
         "asr_models": {},  # ASR model loading status.
