@@ -13,8 +13,14 @@ recognition as well as the old one CANNOT be established by reading code
 measures it. The wording is compiled into the deployed build, so you run the
 script once against the OLD build and once against the NEW build, then compare.
 
-THE METRIC MUST NOT REWARD PROMPT LEAK
---------------------------------------
+THE METRIC MUST NOT REWARD PROMPT LEAK — A GUARANTEE OF `hotwords` ONLY
+-----------------------------------------------------------------------
+This property holds for the `hotwords` condition and ONLY that condition; it
+is not a property of the metric in general. Under `sentence`, the context
+contains the clip's OWN keyword, so a build that echoes its context verbatim
+scores hit=True leak=False — `sentence` hit rates are uninterpretable on a
+leaking build, which is part of why `hotwords` is the sole blocking condition.
+For `hotwords` the reasoning goes through:
 The spec's named failure mode is the model echoing the context INTO the
 transcript instead of using it as a hint. Under the `hotwords` condition every
 request carries every keyword, so a leaking build makes every transcript
@@ -35,12 +41,15 @@ keywords, never numbers or dates.
 
 USAGE
 -----
-  # against a running service (wording = whatever build is deployed):
-  python scripts/h100/bench_context_prompt.py run \
+  # against a running service (wording = whatever build is deployed).
+  # --wording-tag is REQUIRED and records WHICH build produced the file
+  # ('old' or 'new'); compare refuses same-tag or tag-less files (exit 2)
+  # so two runs of the same build can never yield a guaranteed PASS:
+  python scripts/h100/bench_context_prompt.py run --wording-tag old \
       --audio-dir /path/to/clips --out /tmp/wording_old.json
 
   # after redeploying the other build:
-  python scripts/h100/bench_context_prompt.py run \
+  python scripts/h100/bench_context_prompt.py run --wording-tag new \
       --audio-dir /path/to/clips --out /tmp/wording_new.json
 
   # verdict:
@@ -67,7 +76,8 @@ Each clip is transcribed under four conditions per iteration:
             and recorded; NON-blocking (the spec claims no improvement).
 
 Exit codes: run — 0 ok, 2 setup error. compare — 0 PASS, 1 FAIL (blocked),
-2 harness error (e.g. mismatched clip sets between the two runs).
+2 harness error (e.g. mismatched clip sets between the two runs, or both
+files carrying the same/missing wording_tag).
 """
 
 import argparse
@@ -225,6 +235,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 for name, observations in per_clip.items()}
 
     summary = {
+        "wording_tag": args.wording_tag,
         "base_url": args.base_url,
         "audio_dir": str(args.audio_dir),
         "iterations": args.iterations,
@@ -269,6 +280,15 @@ def _load_summary(label: str, path_str: str) -> dict:
         raise _CompareInputError(
             f"MALFORMED {label}: not a `run` summary (missing 'timestamp'). "
             "Both files must come from this script's `run`; no verdict."
+        )
+    # Build identity: without this, comparing two runs of the SAME build
+    # yields a guaranteed PASS — the merge-permitting verdict, on no evidence.
+    if doc.get("wording_tag") not in ("old", "new"):
+        raise _CompareInputError(
+            f"MALFORMED {label} file {path_str}: 'wording_tag' is "
+            f"{doc.get('wording_tag')!r}, expected 'old' or 'new'. Re-run "
+            "`run` with --wording-tag so the file records which build "
+            "produced it; no verdict."
         )
     for condition in CONDITIONS:
         # A missing/mis-typed condition table is a malformed file, not a
@@ -339,6 +359,16 @@ def cmd_compare(args: argparse.Namespace) -> int:
         new = _load_summary("candidate", args.candidate)
     except _CompareInputError as exc:
         print(exc, file=sys.stderr)
+        return 2
+    if old["wording_tag"] == new["wording_tag"]:
+        print(
+            f"SAME WORDING TAG: baseline {args.baseline} and candidate "
+            f"{args.candidate} both carry wording_tag="
+            f"{old['wording_tag']!r} — comparing a build against itself is a "
+            "guaranteed PASS on no evidence. Re-run one side against the "
+            "other build; no verdict.",
+            file=sys.stderr,
+        )
         return 2
     print(f"baseline : {args.baseline} ({old['timestamp']})")
     print(f"candidate: {args.candidate} ({new['timestamp']})")
@@ -422,6 +452,13 @@ def main() -> int:
     run_p = sub.add_parser("run")
     run_p.add_argument("--base-url", default=os.environ.get("ASR_BASE_URL", DEFAULT_BASE_URL))
     run_p.add_argument("--audio-dir", required=True)
+    run_p.add_argument(
+        "--wording-tag",
+        required=True,
+        choices=("old", "new"),
+        help="which build this run measures; recorded in the output JSON so "
+        "`compare` can refuse two runs of the same build (exit 2)",
+    )
     run_p.add_argument("--iterations", type=int, default=10)
     run_p.add_argument("--timeout", type=float, default=120.0)
     run_p.add_argument("--pause", type=float, default=0.5)

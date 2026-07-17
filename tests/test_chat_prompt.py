@@ -52,6 +52,18 @@ class BuildChatPromptTest(unittest.TestCase):
 
         self.assertIn("Transcribe the speech in Indonesian.", prompt)
 
+    def test_context_with_surrounding_whitespace_is_stripped(self) -> None:
+        # Pins the `{context.strip()}` interpolation itself, not just the
+        # empty/whitespace guard: a mutant that drops .strip() from the
+        # f-string must fail here.
+        prompt = _build_chat_prompt(context="  Danantara \n", language="Indonesian")
+
+        self.assertEqual(
+            _system_text(prompt),
+            "Transcribe the speech in Indonesian. "
+            "Use this context when transcribing: Danantara",
+        )
+
     def test_old_named_entity_wording_is_gone(self) -> None:
         prompt = _build_chat_prompt(context="anything", language="Chinese")
 

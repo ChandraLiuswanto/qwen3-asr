@@ -286,8 +286,14 @@ recognition as well as the old one CANNOT be established by reading code
 measures it. The wording is compiled into the deployed build, so you run the
 script once against the OLD build and once against the NEW build, then compare.
 
-THE METRIC MUST NOT REWARD PROMPT LEAK
---------------------------------------
+THE METRIC MUST NOT REWARD PROMPT LEAK — A GUARANTEE OF `hotwords` ONLY
+-----------------------------------------------------------------------
+This property holds for the `hotwords` condition and ONLY that condition; it
+is not a property of the metric in general. Under `sentence`, the context
+contains the clip's OWN keyword, so a build that echoes its context verbatim
+scores hit=True leak=False — `sentence` hit rates are uninterpretable on a
+leaking build, which is part of why `hotwords` is the sole blocking condition.
+For `hotwords` the reasoning goes through:
 The spec's named failure mode is the model echoing the context INTO the
 transcript instead of using it as a hint. Under the `hotwords` condition every
 request carries every keyword, so a leaking build makes every transcript
@@ -308,12 +314,15 @@ keywords, never numbers or dates.
 
 USAGE
 -----
-  # against a running service (wording = whatever build is deployed):
-  python scripts/h100/bench_context_prompt.py run \
+  # against a running service (wording = whatever build is deployed).
+  # --wording-tag is REQUIRED and records WHICH build produced the file
+  # ('old' or 'new'); compare refuses same-tag or tag-less files (exit 2)
+  # so two runs of the same build can never yield a guaranteed PASS:
+  python scripts/h100/bench_context_prompt.py run --wording-tag old \
       --audio-dir /path/to/clips --out /tmp/wording_old.json
 
   # after redeploying the other build:
-  python scripts/h100/bench_context_prompt.py run \
+  python scripts/h100/bench_context_prompt.py run --wording-tag new \
       --audio-dir /path/to/clips --out /tmp/wording_new.json
 
   # verdict:
@@ -340,7 +349,8 @@ Each clip is transcribed under four conditions per iteration:
             and recorded; NON-blocking (the spec claims no improvement).
 
 Exit codes: run — 0 ok, 2 setup error. compare — 0 PASS, 1 FAIL (blocked),
-2 harness error (e.g. mismatched clip sets between the two runs).
+2 harness error (e.g. mismatched clip sets between the two runs, or both
+files carrying the same/missing wording_tag).
 """
 
 import argparse
@@ -498,6 +508,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 for name, observations in per_clip.items()}
 
     summary = {
+        "wording_tag": args.wording_tag,
         "base_url": args.base_url,
         "audio_dir": str(args.audio_dir),
         "iterations": args.iterations,
@@ -542,6 +553,15 @@ def _load_summary(label: str, path_str: str) -> dict:
         raise _CompareInputError(
             f"MALFORMED {label}: not a `run` summary (missing 'timestamp'). "
             "Both files must come from this script's `run`; no verdict."
+        )
+    # Build identity: without this, comparing two runs of the SAME build
+    # yields a guaranteed PASS — the merge-permitting verdict, on no evidence.
+    if doc.get("wording_tag") not in ("old", "new"):
+        raise _CompareInputError(
+            f"MALFORMED {label} file {path_str}: 'wording_tag' is "
+            f"{doc.get('wording_tag')!r}, expected 'old' or 'new'. Re-run "
+            "`run` with --wording-tag so the file records which build "
+            "produced it; no verdict."
         )
     for condition in CONDITIONS:
         # A missing/mis-typed condition table is a malformed file, not a
@@ -612,6 +632,16 @@ def cmd_compare(args: argparse.Namespace) -> int:
         new = _load_summary("candidate", args.candidate)
     except _CompareInputError as exc:
         print(exc, file=sys.stderr)
+        return 2
+    if old["wording_tag"] == new["wording_tag"]:
+        print(
+            f"SAME WORDING TAG: baseline {args.baseline} and candidate "
+            f"{args.candidate} both carry wording_tag="
+            f"{old['wording_tag']!r} — comparing a build against itself is a "
+            "guaranteed PASS on no evidence. Re-run one side against the "
+            "other build; no verdict.",
+            file=sys.stderr,
+        )
         return 2
     print(f"baseline : {args.baseline} ({old['timestamp']})")
     print(f"candidate: {args.candidate} ({new['timestamp']})")
@@ -695,6 +725,13 @@ def main() -> int:
     run_p = sub.add_parser("run")
     run_p.add_argument("--base-url", default=os.environ.get("ASR_BASE_URL", DEFAULT_BASE_URL))
     run_p.add_argument("--audio-dir", required=True)
+    run_p.add_argument(
+        "--wording-tag",
+        required=True,
+        choices=("old", "new"),
+        help="which build this run measures; recorded in the output JSON so "
+        "`compare` can refuse two runs of the same build (exit 2)",
+    )
     run_p.add_argument("--iterations", type=int, default=10)
     run_p.add_argument("--timeout", type=float, default=120.0)
     run_p.add_argument("--pause", type=float, default=0.5)
@@ -727,8 +764,8 @@ if __name__ == "__main__":
 Run: `.venv/bin/python scripts/h100/bench_context_prompt.py --help`
 Expected: usage text with `run` and `compare` subcommands, exit 0.
 
-Run: `.venv/bin/python scripts/h100/bench_context_prompt.py run --audio-dir /tmp --out /tmp/x.json`
-Expected: exits 2 with `need >= 3 keyword-named clips, found 0` (no audio in `/tmp` — proves case loading and argument plumbing work without touching the network).
+Run: `.venv/bin/python scripts/h100/bench_context_prompt.py run --wording-tag old --audio-dir /tmp --out /tmp/x.json`
+Expected: exits 2 with `need >= 3 keyword-named clips, found 0` (no audio in `/tmp` — proves case loading and argument plumbing work without touching the network). Omitting `--wording-tag`, or passing anything other than `old`/`new`, must be rejected by argparse (exit 2) — the tag records which build produced the file so `compare` can refuse same-build comparisons.
 
 - [ ] **Step 3: Verify `compare` and `classify` end-to-end with synthetic fixtures — including the leak rule**
 
@@ -745,18 +782,20 @@ assert classify("kata DANANTARA hari ini", "Danantara", ["Prabowo"]) == (True, [
 assert classify("Danantara Prabowo 阿里巴巴", "Danantara", ["Prabowo", "阿里巴巴"]) == (False, ["Prabowo", "阿里巴巴"])  # echo != hit
 assert classify("tidak ada apa-apa", "Danantara", ["Prabowo"]) == (False, [])
 
-def doc(hot_hit, hot_leak, clip="a.wav", ts="t"):
+def doc(hot_hit, hot_leak, clip="a.wav", ts="t", tag="new"):
     hr = {c: {clip: 0.5} for c in ("none", "sentence", "topic")}
     lr = {c: {clip: 0.0} for c in ("none", "sentence", "topic")}
     hr["hotwords"], lr["hotwords"] = {clip: hot_hit}, {clip: hot_leak}
-    return {"timestamp": ts, "hit_rate": hr, "leak_rate": lr}
+    return {"timestamp": ts, "wording_tag": tag, "hit_rate": hr, "leak_rate": lr}
 
 fixtures = {
-    "old":  doc(0.80, 0.0),
+    "old":  doc(0.80, 0.0, tag="old"),
     "good": doc(0.75, 0.0),              # within the 10pp band -> PASS
     "drop": doc(0.60, 0.0),              # >10pp hit drop -> FAIL
     "leak": doc(0.75, 0.40),             # hit within band BUT leaking -> FAIL (inverted-gate guard)
     "mm":   doc(0.80, 0.0, clip="b.wav"),  # different clip set -> harness error
+    "sametag": doc(0.80, 0.0, tag="old"),  # same build tag as baseline -> harness error
+    "notag": {k: v for k, v in doc(0.75, 0.0).items() if k != "wording_tag"},  # tag-less file -> harness error
 }
 for name, data in fixtures.items():
     open(f"/tmp/wording_{name}.json", "w").write(json.dumps(data))
@@ -769,11 +808,13 @@ assert cmp("old", "good") == 0, "in-band candidate must PASS"
 assert cmp("old", "drop") == 1, "hit drop beyond band must FAIL"
 assert cmp("old", "leak") == 1, "leak increase must FAIL even with acceptable hit rate"
 assert cmp("old", "mm") == 2, "mismatched clip sets must be a harness error, not a fake regression"
+assert cmp("old", "sametag") == 2, "same wording_tag on both sides must be a harness error, never a verdict"
+assert cmp("old", "notag") == 2, "a tag-less file must be a harness error, never a verdict"
 print("compare verdict logic OK, including the leak guard")
 EOF
 ```
 
-Expected: PASS for `good`, FAIL exit 1 for both `drop` and `leak`, exit 2 for the clip-set mismatch, then `compare verdict logic OK, including the leak guard`. A comparator that cannot fail is not evidence — this proves it can fail on both blocking rules, and specifically that a leaking build cannot buy a PASS with an inflated hit rate.
+Expected: PASS for `good`, FAIL exit 1 for both `drop` and `leak`, exit 2 for the clip-set mismatch and for the same-tag and tag-less files, then `compare verdict logic OK, including the leak guard`. A comparator that cannot fail is not evidence — this proves it can fail on both blocking rules, and specifically that a leaking build cannot buy a PASS with an inflated hit rate.
 
 - [ ] **Step 4: Commit**
 
@@ -804,7 +845,13 @@ Assemble **at least 5 Indonesian and 5 Chinese clips** into one directory, named
 
 Why at least 10 clips: the model decodes near-deterministically, so repeated iterations of the same clip are highly correlated — the effective sample size is closer to the number of **distinct clips** than to clips × iterations. More clips buys real resolution; more iterations mostly buys robustness against nondeterminism. See the decision rule in Step 4 for what this sample size can and cannot detect.
 
-Sanity-check headroom first: run once with the OLD build and inspect the `none` condition — if every keyword already hits at 100% with no context, the clips are too easy and the comparison measures nothing. Swap in harder entities until `none` < `hotwords` on at least some clips.
+- [ ] **Step 1a — HARD STOP: headroom gate. Do not proceed to Step 2 until this passes.**
+
+Run the baseline once with the OLD build and inspect the `none` (no-context) condition against `hotwords`:
+
+1. **Criterion:** the `none` hit rate must be materially below the `hotwords` hit rate on the baseline run, on a meaningful share of clips (as a working rule: several clips must miss under `none` while hitting under `hotwords` — not just one).
+2. If every keyword already hits ~100% under `none`, the clips are too easy: `none` ≈ `hotwords`, the context is doing no measurable work, and `compare` will return PASS on a wording change that does nothing. **The instrument cannot detect this condition itself. Skipping this gate makes a PASS meaningless.**
+3. On failure: swap in harder entities (clips the model plausibly misspells without a hint), then re-run the baseline from scratch before proceeding.
 
 - [ ] **Step 2: Baseline run against the OLD wording**
 
@@ -822,7 +869,7 @@ docker compose exec qwen3-asr python -c \
 Then, from the host:
 
 ```bash
-python scripts/h100/bench_context_prompt.py run \
+python scripts/h100/bench_context_prompt.py run --wording-tag old \
     --audio-dir /path/to/clips --iterations 10 --out /tmp/wording_old.json
 ```
 
@@ -840,7 +887,7 @@ docker compose exec qwen3-asr python -c \
 Then:
 
 ```bash
-python scripts/h100/bench_context_prompt.py run \
+python scripts/h100/bench_context_prompt.py run --wording-tag new \
     --audio-dir /path/to/clips --iterations 10 --out /tmp/wording_new.json
 ```
 
@@ -868,10 +915,12 @@ python scripts/h100/bench_context_prompt.py compare /tmp/wording_old.json /tmp/w
 
 - Exit 0 (PASS): record both JSON files' summaries and the compare output in the PR / `bd` issue, explicitly stating the MDE caveat above. Merge may proceed.
 - Exit 1 (FAIL): **do not merge.** Follow the spec's rollback: revert item 1 to the original string (item 2's needle reverts with it — one commit, since they are atomic). Task 2's doc fixes may still land: they describe behavior that is already true today under either wording. File a `bd` issue with the numbers so the next wording attempt starts from data.
-- Exit 2 (harness error, e.g. mismatched clip sets): fix the setup and rerun both sides; there is no verdict.
+- Exit 2 (harness error, e.g. mismatched clip sets, or both files carrying the same/missing `wording_tag` — two runs of the same build compared to each other would be a guaranteed PASS on no evidence): fix the setup and rerun both sides; there is no verdict.
 - Marginal (hit delta inside the band but consistently negative across most clips): add more **distinct clips** — not iterations — and rerun both sides before deciding.
 
-Also record the `topic` condition (keyword-free background — the spec's motivating "general background context" use case) and the `sentence` condition in the write-up: hit and leak rates, old vs new. Neither is a merge criterion — the spec makes no improvement claim and this plan does not smuggle one in — but the topic numbers are the first real data on the use case that motivated the change, and a leak appearing under `topic` or `sentence` on the new wording is worth a `bd` issue even though only `hotwords` blocks.
+Also record the `topic` condition (keyword-free background — the spec's motivating "general background context" use case) and the `sentence` condition in the write-up: hit and leak rates, old vs new. Neither is a merge criterion — the spec makes no improvement claim and this plan does not smuggle one in — but the topic numbers are the first real data on the use case that motivated the change. A leak appearing under `sentence` on the new wording is worth a `bd` issue even though only `hotwords` blocks. But know what each condition can and cannot show:
+- **`topic` CANNOT detect echo, by construction.** `run` enforces that `--topic-context` names no keyword, and a leak is defined as a foreign keyword appearing in the transcript — so under `topic`, even a build that echoes its entire context verbatim scores leak=False necessarily. A clean topic leak_rate is a null instrument, not evidence; **never read topic leak=0 as reassurance.** That means the spec's motivating use case (general background context) has NO automated echo coverage at all — the mandatory manual read of the `text=` printouts (above) is its only coverage.
+- **`sentence` hit rates are uninterpretable on a leaking build.** The sentence context contains the clip's OWN keyword, so an echoing build scores `hit=True leak=False` there — the hit rate rewards the failure mode. This is part of why `hotwords` (where every request carries every keyword, so echo necessarily drags foreign keywords in) is the sole blocking condition.
 
 - [ ] **Step 5: Merge (only after PASS)**
 
