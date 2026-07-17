@@ -42,8 +42,8 @@ class PreloadModelsConfigRepairTest(unittest.TestCase):
                 return_value=object(),
             ),
             mock.patch(
-                "app.utils.speaker_diarizer.get_global_diarization_pipeline",
-                return_value=object(),
+                "app.utils.speaker_diarizer.warmup_diarization_pool",
+                return_value=4,
             ),
             mock.patch("app.utils.text_processing.warmup_itn", return_value=True),
         ]

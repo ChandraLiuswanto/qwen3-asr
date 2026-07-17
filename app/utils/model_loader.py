@@ -533,13 +533,17 @@ def preload_models() -> dict[str, Any]:
         # 5. Preload the required speaker diarization model (CAM++).
         progress.update("加载说话人分离模型(CAM++)")
         try:
-            from ..utils.speaker_diarizer import get_global_diarization_pipeline
+            from ..utils.speaker_diarizer import warmup_diarization_pool
 
-            diarization_pipeline = get_global_diarization_pipeline()
-            if diarization_pipeline:
+            # Build ALL N pool instances now, sequentially: modelscope
+            # pipeline() touches global registries and may download, and a
+            # lazy build at request time would pay N model loads on the
+            # first N requests.
+            pool_size = warmup_diarization_pool()
+            if pool_size >= 1:
                 result["speaker_diarization_model"]["loaded"] = True
             else:
-                result["speaker_diarization_model"]["error"] = "说话人分离模型加载后返回None"
+                result["speaker_diarization_model"]["error"] = "说话人分离池为空"
         except Exception as e:
             result["speaker_diarization_model"]["error"] = str(e)
             logger.error("说话人分离模型(CAM++)加载失败: %s", e)
