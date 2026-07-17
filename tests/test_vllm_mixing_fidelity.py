@@ -207,7 +207,7 @@ class _FakeLLM:
         # submitter. That traceability is what lets us prove WRONG TEXT landed
         # on the WRONG request, rather than just "counts differ".
         text = prompt["prompt"]
-        needle = "resolving named entities: "
+        needle = "when transcribing: "
         start = text.index(needle) + len(needle)
         return text[start:text.index("<|im_end|>", start)].strip()
 
