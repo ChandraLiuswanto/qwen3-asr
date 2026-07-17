@@ -70,7 +70,28 @@ override-aware:
 | `manager.py:126,132` | `exists` flags in the models API | API reports `exists: false` for working models |
 | `download_models.py:52` `_get_cache_path` | Existence check + export | Redundant re-download; bad export |
 | `download_models.py:109` | CAM++ `configuration.json` location | Offline diarization silently unfixed |
-| `download_models.py:182` | Download target dir | Downloads next to, not into, override |
+| `model_loader.py:394` | Runtime CAM++ repair inside `preload_models` | Same, on the serving path |
+| `download_models.py:182` | Display string only | None — see note |
+
+`download_models.py:182` (`ms_cache_dir = Path(settings.MODELSCOPE_PATH)`) is a **display
+string**. The actual downloads (`ms_snapshot_download`/`hf_snapshot_download`, lines
+217-242) pass no target directory and write to the library default cache. Rev 2 first
+listed its consequence as "downloads next to, not into, override"; that was fiction.
+It is listed here only so a reader grepping `MODELSCOPE_PATH` finds it accounted for.
+
+### `.env` must actually reach the process
+
+`load_dotenv()` is called in exactly one place: `start.py:10-12`. So `python -m
+app.utils.download_models` (which `bootstrap.py:35` tells operators to run) and a direct
+`uvicorn app.main:app` never read `.env` at all. A feature whose entire premise is "set
+the path in `.env`" is silently inert on those entrypoints — the CLI would re-download
+models the operator already supplied.
+
+`load_dotenv()` therefore moves to `app/core/config.py`, before `settings` is
+instantiated. Everything imports `settings`, so every entrypoint gets `.env`.
+`load_dotenv` does not override variables already present in the real environment, so
+Docker's explicit `environment:` entries still win and nothing about today's behavior
+changes.
 
 **The boot-abort trap.** `verify_required_models_integrity` (`model_loader.py:301`) is
 called from `app/main.py:83-86`, which raises `RuntimeError` on any invalid model. Its
@@ -196,6 +217,21 @@ with a message saying so, rather than exporting stale weights.
 override points at a read-only mount, the rewrite fails. Proposal: warn on failure,
 but fail loudly when `HF_HUB_OFFLINE=1` (where an unfixed config means diarization
 reaches for modelscope.cn and breaks).
+
+Delivering that "fail loudly" needs **two** suppressions removed, not one. The
+function's own body ends in `except Exception: print(...); return False`
+(`download_models.py:143-145`), and its runtime caller wraps it again in `except
+Exception: pass` (`model_loader.py:394-397`, "Config repair failures should not block
+startup"). A `raise` placed inside the function body is caught twice over and is dead
+code. The write must sit outside the function's catch-all, and `preload_models` must
+re-raise `RuntimeError` specifically.
+
+### Empty values are unset
+
+`MODEL_PATH_VAD=` (empty or whitespace) is treated as **unset**, not as an invalid
+path. This mirrors `API_KEY` handling (`config.py:97`) and makes a commented-template
+`.env` usable. It is a deliberate exception to fail-loud: an empty value expresses no
+intent, so there is nothing to honor or contradict.
 
 ### Docker
 

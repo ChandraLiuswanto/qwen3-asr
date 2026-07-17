@@ -43,6 +43,14 @@ later change lets an overridden model reach either one, it will silently use the
 1. **`ModelAsset.slug` is `Optional[str] = None`, not required.** The spec's Risks section called for a required field touching all nine construction sites. Only six assets need slugs; the Qwen sites (`model_capabilities.py:138,156`) and the Paraformer realtime asset (line 71) are already addressable via `models.json` keys, and giving them a second slug would create two slugs for one model id. Optional is less churn and avoids the collision.
 2. **`model_paths` reaches `ModelAsset` slugs via a function-local import**, rather than not importing `model_capabilities` at all as the spec's Layering note says. The spec's intent was avoiding the import cycle; a deferred import achieves that while keeping `ModelAsset` the single source of truth for support-model ids.
 
+3. **The `FORCED_ALIGNER` slug is sourced from `models.json`'s `extra_kwargs.forced_aligner_path`**, not from the dynamic `ModelAsset` at `model_capabilities.py:156` as the spec's Risks section implies. Equivalent today (both Qwen entries declare the same aligner id, `models.json:46,79`), and reading it from `models.json` keeps `_registry_from_entries` a pure function of the config file — which is what makes the registry unit-testable without the manager stack. If a future entry declares a different aligner, `_record` marks the slug ambiguous and any override of it raises.
+
+Two smaller judgment calls, flagged rather than buried:
+
+- **Empty value means unset.** `MODEL_PATH_VAD=` is skipped, not treated as a bad path. Mirrors `API_KEY` (`config.py:97`) and keeps a commented `.env` template usable. It is a deliberate exception to fail-loud: an empty value expresses no intent.
+- **`_slugify` generalizes the spec's "`-`/`.` → `_`" rule** to "any run of non-alphanumerics → `_`, strip edges". A superset; it cannot change the slug of any current key.
+- **An entry declaring zero models** produces no slug and is silently unaddressable. No current entry does this. Not worth a guard, but do not be surprised by it.
+
 ---
 
 ### Task 1: Add the `slug` field to `ModelAsset`
@@ -775,7 +783,9 @@ class OverridesSkipStartupChecksTest(unittest.TestCase):
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `DEVICE=cpu .venv/bin/python -m unittest tests.test_model_path_overrides -v`
-Expected: FAIL — `test_overridden_model_is_not_integrity_checked` finds `VAD` in the specs; `test_overridden_model_is_not_reported_missing` reports VAD missing.
+Expected: FAIL — `test_overridden_model_is_not_integrity_checked` finds `VAD` in the specs.
+
+Note on `test_overridden_model_is_not_reported_missing`: it only goes red on a machine whose ModelScope cache lacks VAD. If the cache is already populated (any box that has run the app), `check_model_exists` returns True and VAD is not in `missing` regardless — so the test passes before the change. That is expected, not a mistake; it still guards the behavior afterward. Do not "fix" it by deleting it.
 
 - [ ] **Step 3: Skip overridden models in the integrity specs**
 
@@ -923,12 +933,75 @@ class CamppReplacementPathsTest(unittest.TestCase):
             replacements = get_camplusplus_replacement_paths()
 
         self.assertIn(_CAMPP_SV_ID, replacements)
+
+
+class CamppRewriteTargetTest(unittest.TestCase):
+    """Guards spec test 11b and the fail-loud contract on a read-only override."""
+
+    def setUp(self) -> None:
+        model_paths.reset_override_cache()
+        self.addCleanup(model_paths.reset_override_cache)
+
+    def _overridden_campp(self, temp_dir: str) -> dict[str, str]:
+        """Build a diarization override whose config needs a real replacement."""
+        diar_dir = Path(temp_dir) / "diar"
+        diar_dir.mkdir()
+        (diar_dir / "configuration.json").write_text(
+            json.dumps({"model": {"speaker_model": _CAMPP_SV_ID}}), encoding="utf-8"
+        )
+        sv_dir = _make_model_dir(temp_dir, "campp-sv")
+        return {
+            "MODEL_PATH_CAMPP_DIARIZATION": str(diar_dir),
+            "MODEL_PATH_CAMPP_SV": sv_dir,
+        }
+
+    def test_rewrite_targets_the_overridden_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env = self._overridden_campp(temp_dir)
+            with mock.patch.dict(os.environ, env, clear=True):
+                self.assertTrue(fix_camplusplus_config())
+
+            written = json.loads(
+                (Path(env["MODEL_PATH_CAMPP_DIARIZATION"]) / "configuration.json")
+                .read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(
+            written["model"]["speaker_model"],
+            str(Path(env["MODEL_PATH_CAMPP_SV"]).resolve()),
+        )
+
+    def test_readonly_override_raises_when_offline(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env = self._overridden_campp(temp_dir)
+            env["HF_HUB_OFFLINE"] = "1"
+            with mock.patch.dict(os.environ, env, clear=True):
+                with mock.patch(
+                    "app.utils.download_models.json.dump",
+                    side_effect=OSError("read-only file system"),
+                ):
+                    with self.assertRaises(RuntimeError) as ctx:
+                        fix_camplusplus_config()
+
+        self.assertIn("read-only file system", str(ctx.exception))
+
+    def test_readonly_override_only_warns_when_online(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env = self._overridden_campp(temp_dir)
+            with mock.patch.dict(os.environ, env, clear=True):
+                with mock.patch(
+                    "app.utils.download_models.json.dump",
+                    side_effect=OSError("read-only file system"),
+                ):
+                    self.assertFalse(fix_camplusplus_config())
 ```
+
+Add `import json` and `from app.utils.download_models import fix_camplusplus_config` to the test imports.
 
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `DEVICE=cpu .venv/bin/python -m unittest tests.test_model_path_overrides -v`
-Expected: FAIL — `TypeError: get_camplusplus_replacement_paths() missing 1 required positional argument: 'cache_dir'`
+Expected: FAIL — `TypeError: get_camplusplus_replacement_paths() missing 1 required positional argument: 'cache_dir'`, and `test_readonly_override_raises_when_offline` fails because the raise is swallowed by the function's own `except Exception`. That second failure is the whole point of this task: it is the guard on the dead-code trap described in Step 4.
 
 - [ ] **Step 3: Rewrite `get_camplusplus_replacement_paths`**
 
@@ -953,15 +1026,17 @@ The `resolve_model_path` import is function-local: `app.infrastructure.model_uti
 
 - [ ] **Step 4: Fix the rewrite target and write handling**
 
-In `app/utils/download_models.py`, replace the body of `fix_camplusplus_config` between the docstring and the final `except`:
+**The trap:** the existing function ends in `except Exception as e: print(...); return False` (`download_models.py:143-145`). A `raise RuntimeError` placed inside that `try` is caught by the function's own handler, printed as a warning, and turned into `return False` — dead code. The write must sit **outside** the catch-all. Step 6 removes the second suppression.
+
+In `app/utils/download_models.py`, replace the whole body of `fix_camplusplus_config` after its docstring:
 
 ```python
-    try:
-        from app.infrastructure.model_utils import resolve_model_path
+    from app.infrastructure.model_utils import resolve_model_path
 
-        diarization_id = "iic/speech_campplus_speaker-diarization_common"
-        model_dir = Path(resolve_model_path(diarization_id))
-        config_file = model_dir / "configuration.json"
+    diarization_id = "iic/speech_campplus_speaker-diarization_common"
+
+    try:
+        config_file = Path(resolve_model_path(diarization_id)) / "configuration.json"
 
         if not config_file.exists():
             return False
@@ -986,48 +1061,68 @@ In `app/utils/download_models.py`, replace the body of `fix_camplusplus_config` 
                             config["model"][key] = new_value
                             modified = True
 
-        # Write the config file back.
-        if modified:
-            try:
-                with open(config_file, 'w', encoding='utf-8') as f:
-                    json.dump(config, f, indent=4, ensure_ascii=False)
-            except OSError as e:
-                # An override may point at a read-only mount. Offline runs need
-                # this rewrite or diarization reaches for modelscope.cn, so fail
-                # there; online runs can still fetch and only get a warning.
-                message = (
-                    f"Cannot rewrite {config_file} for offline use: {e}. "
-                    f"Make the directory writable, or pre-patch the config."
-                )
-                if is_huggingface_offline():
-                    raise RuntimeError(message) from e
-                print(f"⚠️  {message}")
-                return False
-            return True
-
-        return False
+        if not modified:
+            return False
 
     except Exception as e:
         print(f"⚠️  修复 CAM++ 配置文件失败: {e}")
         return False
+
+    # The write sits outside the catch-all above on purpose: an offline rewrite
+    # failure must be able to abort startup, and that except Exception would
+    # turn the RuntimeError back into a warning.
+    try:
+        with open(config_file, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=4, ensure_ascii=False)
+    except OSError as e:
+        # An override may point at a read-only mount. Offline runs need this
+        # rewrite or diarization reaches for modelscope.cn; online runs can
+        # still fetch, so they only warn.
+        message = (
+            f"Cannot rewrite {config_file} for offline use: {e}. "
+            f"Make the directory writable, or pre-patch the config."
+        )
+        if is_huggingface_offline():
+            raise RuntimeError(message) from e
+        print(f"⚠️  {message}")
+        return False
+
+    return True
 ```
 
-- [ ] **Step 5: Fix the caller's now-stale argument**
+- [ ] **Step 5: Stop `preload_models` from swallowing the offline failure**
+
+`model_loader.py:393-397` wraps the call in `except Exception: pass`, so even a correctly-raised `RuntimeError` dies there. Replace it:
+
+```python
+    # Fix CAM++ config files for offline environments.
+    try:
+        from .download_models import fix_camplusplus_config
+        fix_camplusplus_config()
+    except RuntimeError:
+        # Offline repair failure is fatal: diarization would silently reach for
+        # modelscope.cn at request time. See fix_camplusplus_config.
+        raise
+    except Exception:
+        pass  # Other config repair failures should not block startup.
+```
+
+- [ ] **Step 6: Fix the caller's now-stale argument**
 
 `download_models.py:120` passed `str(cache_dir)`. The `cache_dir` local (line 109) is gone; confirm no other reference remains.
 
 Run: `grep -rn "get_camplusplus_replacement_paths\|ms_cache_dir\|cache_dir" app/utils/download_models.py app/services/asr/model_capabilities.py`
 Expected: no call passes an argument to `get_camplusplus_replacement_paths`; `ms_cache_dir` at line ~182 (a display string in `download_models`) is untouched and still valid.
 
-- [ ] **Step 6: Run tests to verify they pass**
+- [ ] **Step 7: Run tests to verify they pass**
 
-Run: `DEVICE=cpu .venv/bin/python -m unittest tests.test_model_path_overrides -v`
+Run: `DEVICE=cpu .venv/bin/python -m unittest tests.test_model_path_overrides tests.test_model_integrity -v`
 Expected: PASS
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
-git add app/services/asr/model_capabilities.py app/utils/download_models.py tests/test_model_path_overrides.py
+git add app/services/asr/model_capabilities.py app/utils/download_models.py app/utils/model_loader.py tests/test_model_path_overrides.py
 git commit -m "fix: honor overrides in CAM++ offline config rewrite"
 ```
 
@@ -1082,13 +1177,22 @@ class ExportRefusesOverridesTest(unittest.TestCase):
             model_dir = _make_model_dir(temp_dir, "vad")
             export_dir = Path(temp_dir) / "export"
             with mock.patch.dict(os.environ, {"MODEL_PATH_VAD": model_dir}, clear=True):
-                result = run_download_models(
-                    auto_mode=True, export_dir=str(export_dir)
-                )
+                # check_all_models is mocked so this test can never reach a real
+                # snapshot_download or a multi-GB copytree. The guard under test
+                # sits BEFORE this call; if it regresses, the test fails fast and
+                # offline rather than hammering the network.
+                with mock.patch(
+                    "app.utils.download_models.check_all_models", return_value=[]
+                ):
+                    result = run_download_models(
+                        auto_mode=True, export_dir=str(export_dir)
+                    )
 
         self.assertFalse(result)
         self.assertFalse(export_dir.exists())
 ```
+
+**Do not drop that mock.** Step 2 runs this test *before* the guard exists, so an unmocked run would fall through to `check_all_models()` — and with `clear=True` wiping `HF_HUB_OFFLINE`, `download_models` would either start real multi-GB downloads (`download_models.py:217,242`) or `copytree` every cached model into the temp dir (`:262-300`).
 
 - [ ] **Step 2: Run tests to verify they fail**
 
@@ -1169,26 +1273,35 @@ git commit -m "feat: report overridden models as present, refuse export with ove
 
 ---
 
-### Task 7: Boot validation, Docker, and documentation
+### Task 7: Make `.env` reach every entrypoint, plus boot validation, Docker, and docs
 
-Validation is lazy (Task 2), so every entrypoint validates on first resolution — including `WORKERS>1`, `python -m app.utils.download_models`, and direct `uvicorn app.main:app`, none of which run `bootstrap`. This task adds an *early, clean* failure for the common CLI path on top of that, placed **outside** `ensure_models_downloaded`'s `except Exception` (`bootstrap.py:40-42`), which would otherwise downgrade the `ValueError` to a `⚠️` print.
+**The premise bug.** `load_dotenv()` is called in exactly one place — `start.py:10-12`. So `python -m app.utils.download_models` (which `bootstrap.py:35` tells operators to run) and a direct `uvicorn app.main:app` **never read `.env` at all**. A feature whose whole premise is "set the path in `.env`" is silently inert there: the CLI would cheerfully re-download models the operator already supplied. Task 2's lazy validation fires on those paths, but with an empty environment it has nothing to validate — validation that never sees the config cannot protect it.
+
+Moving `load_dotenv()` into `app/core/config.py` fixes it for every entrypoint at once, because everything imports `settings`. `load_dotenv` does not override variables already set in the real environment, so Docker's explicit `environment:` entries still win and no current behavior changes.
+
+Validation is lazy (Task 2), so every entrypoint also validates on first resolution — including `WORKERS>1` (`start.py:76-78` skips preflight), which reaches it via `main.py:83-86` → `verify_required_models_integrity` → Task 4's `is_overridden`. This task adds an *early, clean* failure for the common CLI path on top of that, placed **outside** `ensure_models_downloaded`'s `except Exception` (`bootstrap.py:40-42`), which would otherwise downgrade the `ValueError` to a `⚠️` print.
 
 **Files:**
+- Modify: `app/core/config.py` (add `load_dotenv`), `start.py:10-12` (drop the now-redundant call)
 - Modify: `app/bootstrap.py:9-42`
 - Modify: `docker-compose.yml`, `docker-compose-cpu.yml`
 - Modify: `.env.example`
 - Test: `tests/test_model_path_overrides.py` (extend)
 
 **Interfaces:**
-- Consumes: `get_model_path_overrides` (Task 2).
+- Consumes: `get_model_path_overrides` (Task 2), `is_overridden` (Task 4).
 - Produces: `validate_model_path_overrides() -> None` in `app/bootstrap.py`.
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing tests**
 
 Append to `tests/test_model_path_overrides.py`:
 
 ```python
+import subprocess
+import sys
+
 from app.bootstrap import validate_model_path_overrides
+from app.utils.model_loader import _build_required_model_integrity_specs
 
 
 class BootstrapValidationTest(unittest.TestCase):
@@ -1208,12 +1321,64 @@ class BootstrapValidationTest(unittest.TestCase):
             model_dir = _make_model_dir(temp_dir, "vad")
             with mock.patch.dict(os.environ, {"MODEL_PATH_VAD": model_dir}, clear=True):
                 validate_model_path_overrides()  # must not raise
+
+
+class ValidationFiresWithoutBootstrapTest(unittest.TestCase):
+    """Spec test 13: the WORKERS>1 and standalone-CLI paths never call bootstrap."""
+
+    def setUp(self) -> None:
+        model_paths.reset_override_cache()
+        self.addCleanup(model_paths.reset_override_cache)
+
+    def test_integrity_check_rejects_bad_override(self) -> None:
+        # The WORKERS>1 path: start.py skips preflight, main.py's lifespan calls
+        # verify_required_models_integrity, which must still refuse to start.
+        with mock.patch.dict(
+            os.environ, {"MODEL_PATH_VAD": "/nonexistent/vad"}, clear=True
+        ):
+            with self.assertRaises(ValueError):
+                _build_required_model_integrity_specs()
+
+    def test_download_cli_rejects_bad_override(self) -> None:
+        with mock.patch.dict(
+            os.environ, {"MODEL_PATH_VAD": "/nonexistent/vad"}, clear=True
+        ):
+            with self.assertRaises(ValueError):
+                run_download_models(auto_mode=True)
+
+
+class DotenvReachesEveryEntrypointTest(unittest.TestCase):
+    def test_importing_settings_loads_dotenv(self) -> None:
+        # A subprocess with a .env in cwd and nothing in the environment: importing
+        # settings alone must make MODEL_PATH_VAD visible. This is what makes the
+        # standalone CLI and bare uvicorn honor .env at all.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = _make_model_dir(temp_dir, "vad")
+            (Path(temp_dir) / ".env").write_text(
+                f"MODEL_PATH_VAD={model_dir}\n", encoding="utf-8"
+            )
+            env = {k: v for k, v in os.environ.items() if not k.startswith("MODEL_PATH_")}
+            env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import app.core.config, os; print(os.getenv('MODEL_PATH_VAD'))",
+                ],
+                cwd=temp_dir,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+
+        self.assertEqual(result.stdout.strip(), model_dir, result.stderr)
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [ ] **Step 2: Run tests to verify they fail**
 
 Run: `DEVICE=cpu .venv/bin/python -m unittest tests.test_model_path_overrides -v`
-Expected: FAIL — `ImportError: cannot import name 'validate_model_path_overrides'`
+Expected: FAIL — `ImportError: cannot import name 'validate_model_path_overrides'`. After Step 3 lands, `test_importing_settings_loads_dotenv` still fails (prints `None`) until Step 4.
 
 - [ ] **Step 3: Add early validation to bootstrap**
 
@@ -1244,12 +1409,32 @@ def ensure_models_downloaded(interactive: bool) -> bool:
         ...
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [ ] **Step 4: Load `.env` from `app/core/config.py`**
+
+At the top of `app/core/config.py`, after the existing imports and before the `Settings` class:
+
+```python
+from dotenv import load_dotenv
+
+# Loaded here rather than in start.py alone: `python -m app.utils.download_models`
+# and a bare `uvicorn app.main:app` never run start.py, so .env was invisible to
+# them. Everything imports settings, so this reaches every entrypoint. Real
+# environment variables already set take precedence (load_dotenv does not
+# override), so Docker's explicit `environment:` entries still win.
+load_dotenv()
+```
+
+Then remove the now-redundant `load_dotenv()` and its import from `start.py:10-12`. Confirm `python-dotenv` is already a dependency (it is — `start.py:10` imports it today).
+
+Run: `grep -n "dotenv" pyproject.toml environments/*/pyproject.toml 2>/dev/null; grep -rn "dotenv" start.py app/core/config.py`
+Expected: `load_dotenv` now appears only in `app/core/config.py`.
+
+- [ ] **Step 5: Run tests to verify they pass**
 
 Run: `DEVICE=cpu .venv/bin/python -m unittest tests.test_model_path_overrides -v`
-Expected: PASS
+Expected: PASS, including `test_importing_settings_loads_dotenv`.
 
-- [ ] **Step 5: Add `env_file` to both compose files**
+- [ ] **Step 6: Add `env_file` to both compose files**
 
 `MODEL_PATH_*` cannot be enumerated under `environment:` — Compose has no globbing, and a per-model entry is the per-model code change goal #2 forbids. `required: false` matters: a bare `env_file: .env` is a hard error when the file is absent, and both files run fine without one today. Needs Compose v2.24+.
 
@@ -1261,12 +1446,12 @@ In `docker-compose.yml` and `docker-compose-cpu.yml`, add above `environment:`:
         required: false
 ```
 
-- [ ] **Step 6: Verify compose still parses without a `.env`**
+- [ ] **Step 7: Verify compose still parses without a `.env`**
 
 Run: `docker compose -f docker-compose.yml config >/dev/null && docker compose -f docker-compose-cpu.yml config >/dev/null && echo OK`
 Expected: `OK`. If it errors with `env_file` unsupported syntax, the local Compose is below v2.24 — report that rather than reverting to `env_file: .env`, which breaks the no-`.env` case.
 
-- [ ] **Step 7: Document in `.env.example`**
+- [ ] **Step 8: Document in `.env.example`**
 
 Replace the "Model cache behavior" section at the end of `.env.example`:
 
@@ -1323,12 +1508,12 @@ Replace the "Model cache behavior" section at the end of `.env.example`:
 # -----------------------------------------------------------------------------
 ```
 
-- [ ] **Step 8: Run the full suite**
+- [ ] **Step 9: Run the full suite**
 
 Run: `DEVICE=cpu .venv/bin/python -m unittest discover -s tests`
 Expected: PASS
 
-- [ ] **Step 9: Verify defaults are genuinely untouched**
+- [ ] **Step 10: Verify defaults are genuinely untouched**
 
 Run: `DEVICE=cpu env -u MODEL_PATH_VAD .venv/bin/python -c "
 from app.core.model_paths import get_model_path_overrides
@@ -1338,11 +1523,11 @@ print(resolve_model_path('damo/speech_fsmn_vad_zh-cn-16k-common-pytorch'))
 "`
 Expected: prints the cache path or the bare model id — whichever it printed before this branch. No exception.
 
-- [ ] **Step 10: Commit**
+- [ ] **Step 11: Commit**
 
 ```bash
-git add app/bootstrap.py docker-compose.yml docker-compose-cpu.yml .env.example tests/test_model_path_overrides.py
-git commit -m "feat: validate overrides at boot, wire .env through compose, document"
+git add app/core/config.py start.py app/bootstrap.py docker-compose.yml docker-compose-cpu.yml .env.example tests/test_model_path_overrides.py
+git commit -m "feat: load .env everywhere, validate overrides at boot, document"
 ```
 
 ---
