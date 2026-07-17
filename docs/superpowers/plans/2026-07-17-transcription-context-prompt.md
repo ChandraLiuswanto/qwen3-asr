@@ -528,7 +528,10 @@ def _load_summary(label: str, path_str: str) -> dict:
         doc = json.loads(Path(path_str).read_text(encoding="utf-8"))
     except OSError as exc:
         raise _CompareInputError(f"cannot read {label} file {path_str}: {exc}")
-    except json.JSONDecodeError as exc:
+    except ValueError as exc:
+        # ValueError covers both json.JSONDecodeError (not JSON) and
+        # UnicodeDecodeError (not UTF-8 text, e.g. an audio file passed by
+        # mistake). Both are harness errors, never a verdict.
         raise _CompareInputError(f"{label} file {path_str} is not valid JSON: {exc}")
     if not isinstance(doc, dict) or "timestamp" not in doc:
         raise _CompareInputError(
@@ -551,6 +554,17 @@ def _load_summary(label: str, path_str: str) -> dict:
                 "script's `run`; no verdict."
             )
         for key in ("hit_rate", "leak_rate"):
+            # An EMPTY per-clip table is a shape `run` can never emit (it
+            # enforces >= 3 clips at startup) — and letting it through would
+            # let a zero-data file score as PASS. A verdict, especially on the
+            # blocking `hotwords` condition, must never be computed from zero
+            # observations; no verdict, exit 2.
+            if not doc[key][condition]:
+                raise _CompareInputError(
+                    f"MALFORMED {label}: {key} for {condition!r} has no clips. "
+                    "A real `run` records >= 3 clips per condition; a PASS "
+                    "must never be computed from zero observations. No verdict."
+                )
             bad = [
                 clip for clip, value in doc[key][condition].items()
                 if not isinstance(value, (int, float)) or isinstance(value, bool)
