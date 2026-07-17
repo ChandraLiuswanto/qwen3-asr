@@ -85,8 +85,20 @@ class Settings:
     # Runtime 并发配置（按 backend 独立控制）
     QWEN_RUST_CPU_WORKERS: int = 4
     FUNASR_WORKERS: int = 1
+    # 不变量：必须保持 VLLM_OFFLINE_CONCURRENCY <= DIARIZATION_POOL_SIZE
+    # （见下方 DIARIZATION_POOL_SIZE 的说明），否则 executor 线程会阻塞等待
+    # pipeline 实例。
     VLLM_OFFLINE_CONCURRENCY: int = 4
     VLLM_WS_DECODE_CONCURRENCY: int = 4
+
+    # CAM++ 说话人分离 pipeline 池大小。每个实例独立持有模型权重与 CUDA
+    # 缓存 —— 生产环境的取值必须以 H100 上 nvidia-smi 实测的单实例显存增量
+    # 为准（见 docs/superpowers/specs/2026-07-17-diarization-throughput-design.md），
+    # 不要凭空调大。
+    # 不变量：必须保持 VLLM_OFFLINE_CONCURRENCY <= DIARIZATION_POOL_SIZE，
+    # 否则 executor 线程会阻塞在 queue.Queue.get() 上等 pipeline，
+    # 占着并发额度饿死其他请求（与 change A 治理过的饥饿同类）。
+    DIARIZATION_POOL_SIZE: int = 4
 
     def __init__(self):
         """从环境变量读取配置"""
@@ -154,6 +166,22 @@ class Settings:
         self.VLLM_WS_DECODE_CONCURRENCY = self._positive_int_from_env(
             "VLLM_WS_DECODE_CONCURRENCY", self.VLLM_WS_DECODE_CONCURRENCY
         )
+        self.DIARIZATION_POOL_SIZE = self._positive_int_from_env(
+            "DIARIZATION_POOL_SIZE", self.DIARIZATION_POOL_SIZE
+        )
+        if self.VLLM_OFFLINE_CONCURRENCY > self.DIARIZATION_POOL_SIZE:
+            # Documented invariant (spec: blocking queue.Queue.get() holds an
+            # executor slot). Warn loudly rather than refuse to boot: the
+            # operator may run with diarization disabled per-request.
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "VLLM_OFFLINE_CONCURRENCY (%d) > DIARIZATION_POOL_SIZE (%d): "
+                "diarization-enabled requests may block executor threads "
+                "waiting for a pipeline instance",
+                self.VLLM_OFFLINE_CONCURRENCY,
+                self.DIARIZATION_POOL_SIZE,
+            )
 
         # Only override models.json when the operator actually sets it; an
         # unset value must leave the existing per-model config alone.
