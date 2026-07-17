@@ -284,7 +284,7 @@ curl -X POST "http://localhost:8000/v1/audio/transcriptions" \
 | `sample_rate` | int | `16000` | Sample rate |
 | `enable_speaker_diarization` | bool | `true` | Enable speaker diarization |
 | `word_timestamps` | bool | `false` | Return word-level timestamps when the backend supports them. Qwen CUDA vLLM and CPU Rust automatically use the forced aligner when enabled. |
-| `vocabulary_id` | string | - | Hotword context (for example: `word1 word2`). **Deprecated:** numeric weights are unsupported and ignored. |
+| `vocabulary_id` | string | - | Free-form background context to help transcription — topic, domain, setting, or proper nouns; a space-separated hotword list (for example: `word1 word2`) still works. **Deprecated:** numeric weights are unsupported and ignored. |
 
 **Usage Examples:**
 

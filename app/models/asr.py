@@ -44,7 +44,7 @@ class ASRQueryParams(BaseModel):
 
     vocabulary_id: Optional[str] = Field(
         default=None,
-        description="无权重热词上下文（如：阿里巴巴 腾讯）。[Deprecated] 数字权重语法不受支持，传入时会被忽略",
+        description="辅助识别的自由文本背景上下文——主题、领域、场景或专有名词均可（如：科技行业季度财报会议 阿里巴巴 腾讯）；空格分隔的热词列表仍然有效。[Deprecated] 数字权重语法不受支持，传入时会被忽略",
         max_length=512,
     )
 

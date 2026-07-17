@@ -410,7 +410,7 @@ def _get_transcription_description() -> str:
 - `/v1/models` 仍可用于查看当前服务端实际在线模型
 
 **暂不支持的参数：**
-`prompt`、`temperature`、`timestamp_granularities` 参数已保留但暂不生效
+`temperature`、`timestamp_granularities` 参数已保留但暂不生效
 """
 
 
@@ -493,7 +493,7 @@ async def create_transcription(
         examples=["verbose_json", "json", "text", "srt", "vtt"],
     ),
     # 6. 兼容性参数
-    prompt: Optional[str] = Form(None, description="提示文本，作为命名实体上下文注入转写提示（hotwords）"),
+    prompt: Optional[str] = Form(None, description="上下文提示文本，作为背景信息注入转写提示（如主题、领域、专有名词）"),
     temperature: Optional[float] = Form(0, description="采样温度（暂不支持，保留兼容）"),  # noqa: ARG001
     timestamp_granularities: Optional[List[str]] = Form(  # noqa: ARG001
         None,
@@ -503,7 +503,7 @@ async def create_transcription(
 ):
     """音频转写 API (OpenAI Audio API 兼容)"""
     # 标记暂不支持的参数（保留以兼容 OpenAI API）
-    _ = (prompt, temperature, timestamp_granularities)
+    _ = (temperature, timestamp_granularities)
 
     prepared_audio: Optional[PreparedAudio] = None
     response_cleanup_managed = False

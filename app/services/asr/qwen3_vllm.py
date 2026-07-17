@@ -78,7 +78,7 @@ def _build_chat_prompt(context: str = "", language: Optional[str] = None) -> str
     else:
         instructions.append("Transcribe the speech accurately.")
     if context.strip():
-        instructions.append(f"Use this context when resolving named entities: {context.strip()}")
+        instructions.append(f"Use this context when transcribing: {context.strip()}")
     system_text = " ".join(instructions).strip()
     return (
         f"<|im_start|>system\n{system_text}<|im_end|>\n"
