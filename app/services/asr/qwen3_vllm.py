@@ -48,6 +48,18 @@ _LANGUAGE_ALIASES = {
     "vi": "Vietnamese",
 }
 
+# Canonical language names accepted by Qwen3-ASR, verbatim from upstream
+# qwen_asr/inference/utils.py (SUPPORTED_LANGUAGES). Anything outside this
+# set must raise — injecting a guess into the assistant prefill trains
+# nothing and corrupts the output contract.
+_SUPPORTED_LANGUAGES = frozenset({
+    "Chinese", "English", "Cantonese", "Arabic", "German", "French",
+    "Spanish", "Portuguese", "Indonesian", "Italian", "Korean", "Russian",
+    "Thai", "Vietnamese", "Japanese", "Turkish", "Hindi", "Malay", "Dutch",
+    "Swedish", "Danish", "Finnish", "Polish", "Czech", "Filipino", "Persian",
+    "Greek", "Romanian", "Hungarian", "Macedonian",
+})
+
 
 def is_vllm_available() -> bool:
     """Return True when the official vLLM runtime is installed."""
@@ -60,12 +72,17 @@ def _normalize_language_name(language: Optional[str]) -> Optional[str]:
     normalized = language.strip()
     if not normalized:
         return None
-    alias = _LANGUAGE_ALIASES.get(normalized.lower())
-    if alias:
-        return alias
-    if " " in normalized:
-        return " ".join(part.capitalize() for part in normalized.split())
-    return normalized.capitalize()
+    canonical = _LANGUAGE_ALIASES.get(normalized.lower())
+    if canonical is None:
+        # Upstream canonical form: first letter upper, rest lower
+        # (qwen_asr normalize_language_name).
+        canonical = normalized[:1].upper() + normalized[1:].lower()
+    if canonical not in _SUPPORTED_LANGUAGES:
+        raise ValueError(
+            f"Unsupported language: {language!r} (canonical form {canonical!r}). "
+            f"Supported: {sorted(_SUPPORTED_LANGUAGES)}"
+        )
+    return canonical
 
 
 def _load_audio(audio_path: str) -> np.ndarray:
