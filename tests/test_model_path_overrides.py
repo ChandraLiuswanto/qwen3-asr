@@ -5,6 +5,11 @@ from pathlib import Path
 from unittest import mock
 
 from app.core import model_paths
+from app.core.config import settings
+from app.infrastructure.model_utils import (
+    find_huggingface_snapshot_dir,
+    resolve_model_path,
+)
 from app.services.asr.model_capabilities import get_slugged_assets
 
 
@@ -225,3 +230,38 @@ class SlugRegistryTest(unittest.TestCase):
         _, ambiguous = model_paths._registry_from_entries(entries)
 
         self.assertEqual(ambiguous["FORCED_ALIGNER"], {"org/aligner-one", "org/aligner-two"})
+
+
+_VAD_ID = "damo/speech_fsmn_vad_zh-cn-16k-common-pytorch"
+
+
+class ResolutionWithOverridesTest(unittest.TestCase):
+    def setUp(self) -> None:
+        model_paths.reset_override_cache()
+        self.addCleanup(model_paths.reset_override_cache)
+
+    def test_modelscope_override_wins_over_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = _make_model_dir(temp_dir, "vad")
+            with mock.patch.dict(os.environ, {"MODEL_PATH_VAD": model_dir}, clear=True):
+                resolved = resolve_model_path(_VAD_ID)
+
+            self.assertEqual(resolved, str(Path(model_dir).resolve()))
+
+    def test_without_override_modelscope_resolution_is_unchanged(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            resolved = resolve_model_path(_VAD_ID)
+
+        # No override and (in a clean test env) no cache entry: falls through to
+        # the bare id exactly as it does today.
+        self.assertIn(resolved, {_VAD_ID, str(Path(settings.MODELSCOPE_PATH) / _VAD_ID)})
+
+    def test_huggingface_override_returns_flat_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = _make_model_dir(temp_dir, "qwen")
+            with mock.patch.dict(
+                os.environ, {"MODEL_PATH_QWEN3_ASR_1_7B": model_dir}, clear=True
+            ):
+                resolved = find_huggingface_snapshot_dir("Qwen/Qwen3-ASR-1.7B")
+
+            self.assertEqual(resolved, Path(model_dir).resolve())

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Optional
 
 from app.core.config import settings
+from app.core.model_paths import get_override
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,13 @@ def get_huggingface_model_cache_dir(model_id: str) -> Path:
 
 
 def find_huggingface_snapshot_dir(model_ref_or_path: str) -> Optional[Path]:
+    override = get_override(model_ref_or_path)
+    if override is not None:
+        logger.info(
+            "Using MODEL_PATH override for %s: %s", model_ref_or_path, override
+        )
+        return override
+
     raw_path = Path(model_ref_or_path).expanduser()
     if raw_path.exists():
         return raw_path.resolve()
@@ -85,6 +93,11 @@ def resolve_huggingface_snapshot_dir(model_ref_or_path: str) -> Path:
 def resolve_model_path(model_id: Optional[str]) -> str:
     if not model_id:
         raise ValueError("model_id is required")
+
+    override = get_override(model_id)
+    if override is not None:
+        logger.info("Using MODEL_PATH override for %s: %s", model_id, override)
+        return str(override)
 
     local_path = Path(settings.MODELSCOPE_PATH) / model_id
 
