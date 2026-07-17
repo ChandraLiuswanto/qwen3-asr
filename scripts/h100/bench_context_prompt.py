@@ -240,39 +240,88 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+class _CompareInputError(Exception):
+    """A harness/setup problem with `compare`'s inputs. Never a verdict:
+    cmd_compare translates this to exit 2, so exit 1 stays reserved for a
+    genuine computed regression — a harness error must never impersonate a
+    verdict."""
+
+
+def _load_summary(label: str, path_str: str) -> dict:
+    """Load and structurally validate one `run` output file. Any failure —
+    unreadable path, non-JSON content, or a shape `run` would never emit —
+    raises _CompareInputError (exit 2), not a traceback (exit 1)."""
+    try:
+        doc = json.loads(Path(path_str).read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise _CompareInputError(f"cannot read {label} file {path_str}: {exc}")
+    except json.JSONDecodeError as exc:
+        raise _CompareInputError(f"{label} file {path_str} is not valid JSON: {exc}")
+    if not isinstance(doc, dict) or "timestamp" not in doc:
+        raise _CompareInputError(
+            f"MALFORMED {label}: not a `run` summary (missing 'timestamp'). "
+            "Both files must come from this script's `run`; no verdict."
+        )
+    for condition in CONDITIONS:
+        # A missing/mis-typed condition table is a malformed file, not a
+        # verdict. Guard it here: indexing it in the scoring loop would raise
+        # and exit 1, which this plan defines as "regression confirmed, do
+        # not merge".
+        missing = [
+            k for k in ("hit_rate", "leak_rate")
+            if not isinstance(doc.get(k), dict) or not isinstance(doc[k].get(condition), dict)
+        ]
+        if missing:
+            raise _CompareInputError(
+                f"MALFORMED {label}: {condition!r} absent (or not a per-clip "
+                f"table) in {missing}. Both files must come from this "
+                "script's `run`; no verdict."
+            )
+        for key in ("hit_rate", "leak_rate"):
+            bad = [
+                clip for clip, value in doc[key][condition].items()
+                if not isinstance(value, (int, float)) or isinstance(value, bool)
+            ]
+            if bad:
+                raise _CompareInputError(
+                    f"MALFORMED {label}: non-numeric {key} for clips {sorted(bad)} "
+                    f"in {condition!r}; no verdict."
+                )
+        if set(doc["hit_rate"][condition]) != set(doc["leak_rate"][condition]):
+            raise _CompareInputError(
+                f"MALFORMED {label}: hit_rate and leak_rate list different "
+                f"clips in {condition!r}. Both files must come from this "
+                "script's `run`; no verdict."
+            )
+    return doc
+
+
 def cmd_compare(args: argparse.Namespace) -> int:
-    old = json.loads(Path(args.baseline).read_text(encoding="utf-8"))
-    new = json.loads(Path(args.candidate).read_text(encoding="utf-8"))
+    try:
+        old = _load_summary("baseline", args.baseline)
+        new = _load_summary("candidate", args.candidate)
+    except _CompareInputError as exc:
+        print(exc, file=sys.stderr)
+        return 2
     print(f"baseline : {args.baseline} ({old['timestamp']})")
     print(f"candidate: {args.candidate} ({new['timestamp']})")
     # Refuse mismatched clip sets rather than scoring a missing clip as 0.0,
-    # which would manufacture a fake regression (or hide a real one).
+    # which would manufacture a fake regression (or hide a real one). Checked
+    # on BOTH tables: _load_summary guarantees hit_rate/leak_rate agree
+    # within one file, and this guarantees they agree across the two files.
     for condition in CONDITIONS:
-        # A missing condition key is a malformed file, not a verdict. Guard it
-        # here: indexing it below would raise KeyError and exit 1, which this
-        # plan defines as "regression confirmed, do not merge" — a harness
-        # error must never impersonate that.
-        for label, doc in (("baseline", old), ("candidate", new)):
-            missing = [k for k in ("hit_rate", "leak_rate") if condition not in doc.get(k, {})]
-            if missing:
+        for key in ("hit_rate", "leak_rate"):
+            old_clips = set(old[key][condition])
+            new_clips = set(new[key][condition])
+            if old_clips != new_clips:
                 print(
-                    f"MALFORMED {label}: {condition!r} absent from {missing}. "
-                    "Both files must come from this script's `run`; no verdict.",
+                    f"CLIP SET MISMATCH in {condition!r} ({key}): "
+                    f"only in baseline {sorted(old_clips - new_clips)}, "
+                    f"only in candidate {sorted(new_clips - old_clips)}. "
+                    "Both runs must use the identical audio dir; rerun.",
                     file=sys.stderr,
                 )
                 return 2
-
-        old_clips = set(old["hit_rate"].get(condition, {}))
-        new_clips = set(new["hit_rate"].get(condition, {}))
-        if old_clips != new_clips:
-            print(
-                f"CLIP SET MISMATCH in {condition!r}: "
-                f"only in baseline {sorted(old_clips - new_clips)}, "
-                f"only in candidate {sorted(new_clips - old_clips)}. "
-                "Both runs must use the identical audio dir; rerun.",
-                file=sys.stderr,
-            )
-            return 2
 
     def avg(rates: dict) -> float:
         return sum(rates.values()) / len(rates) if rates else 0.0
