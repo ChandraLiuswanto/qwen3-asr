@@ -377,10 +377,17 @@ class CamppReplacementPathsTest(unittest.TestCase):
             self.assertEqual(replacements[_CAMPP_SV_ID], str(Path(model_dir).resolve()))
 
     def test_replacement_paths_use_cache_without_override(self) -> None:
-        with mock.patch.dict(os.environ, {}, clear=True):
-            replacements = get_camplusplus_replacement_paths()
+        # With no override set, the map must resolve to the ModelScope cache
+        # entry. Asserting the VALUE (not just the hardcoded key) is what makes
+        # this fail if resolution ever stops consulting the cache.
+        with tempfile.TemporaryDirectory() as cache_dir:
+            cache_model_dir = _make_model_dir(cache_dir, _CAMPP_SV_ID)
 
-        self.assertIn(_CAMPP_SV_ID, replacements)
+            with mock.patch.object(settings, "MODELSCOPE_PATH", cache_dir):
+                with mock.patch.dict(os.environ, {}, clear=True):
+                    replacements = get_camplusplus_replacement_paths()
+
+            self.assertEqual(replacements[_CAMPP_SV_ID], cache_model_dir)
 
 
 class CamppRewriteTargetTest(unittest.TestCase):
