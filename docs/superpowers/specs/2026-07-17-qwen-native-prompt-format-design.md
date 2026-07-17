@@ -149,18 +149,22 @@ subtitles, stored records, feeding another model) can be handed attacker-chosen 
 | Adopt `qwen_asr` | **Rejected** | Official streaming *"does not support batch inference or returning timestamps."* We need all three. Diarization has zero official coverage. |
 | Empty-context system turn | **Emit it, empty** | The template has **no conditional** on that line. `qwen_asr` agrees (`content: context or ""`). vLLM's `if context else ""` **diverges from the model's own template** despite claiming to mirror the SDK. The template wins. |
 | Sanitization | vLLM's regex, **to a fixpoint** | Single-pass `re.sub` reconstructs control tokens. Not optional. |
-| Unsupported language | **Raise** | Upstream validates (`utils.py:105`). We inject `Tl` and hope. |
+| Unsupported language | **Raise** | Upstream validates (`qwen_asr/inference/utils.py:105`). We inject `Tl` and hope. |
 | ISO alias map | **Keep** | `_LANGUAGE_ALIASES` (`:26`) maps `id` → `Indonesian`. Upstream accepts only full names; our layer is strictly friendlier and feeds the same canonical value. |
 
 ## Architecture
 
 ### `_build_chat_prompt` (`qwen3_vllm.py:74`)
 
-**Becomes a method on `Qwen3VLLMBackend`**, reading `self._tokenizer` (`:189`). It is currently
-a module-level pure function, but it now needs the tokenizer, and both call sites (`:283`,
-`:459`) are already instance methods. The alternative — threading a tokenizer parameter through
-a module function — buys testability we do not need, since the tests below render against a real
-tokenizer anyway. It must never construct a tokenizer per invocation.
+**Becomes a method on `Qwen3VLLMBackend`**, reading `self._tokenizer` (`:189`) and
+`self._chat_template`. It is currently a module-level pure function; both call sites (`:283`,
+`:459`) are already instance methods. It must never construct a tokenizer per invocation.
+
+**The tokenizer is not actually load-bearing for rendering** — `apply_chat_template(...,
+tokenize=False)` is pure Jinja, and a bare `PreTrainedTokenizerBase()` renders this template
+correctly with **no model files present at all** (verified). That fact is what makes the unit
+tests below runnable on a box with no model; it does not change the production wiring, which
+uses the real tokenizer already in hand.
 
 ```python
 msgs = [
@@ -329,6 +333,11 @@ against the real tokenizer files.
   present in the model snapshot and readable at init. An override pointing at a directory
   without it (see the `MODEL_PATH_*` mechanism) fails engine startup by design — loudly, rather
   than silently reinventing a template.
+- **The dev venv does not match the pin.** `pyproject.toml:32` pins `transformers>=4.57,<4.58`,
+  but the CPU dev venv carries **4.49.0**. Rendering is identical on both (verified on 4.49),
+  so the unit tests are trustworthy — but any claim of the form "this works on the pinned
+  version" is only established for 4.49 locally. The container is the only place 4.57 is
+  exercised. This mismatch predates this design and is worth its own `bd` issue.
 - **A future model may ship `chat_template.jinja` instead.** If Qwen moves to the modern file,
   the tokenizer would load it natively and the explicit `chat_template=` argument becomes
   redundant but harmless. Read `.json` and fall back to the tokenizer's own template only if we
@@ -349,5 +358,10 @@ against the real tokenizer files.
 ## Rollback
 
 Revert `_build_chat_prompt` to the hand-written template. It has no state and no migration.
-The sanitizer and language validation are independent hardening and should survive a rollback
-of the format change — they fix a live injection, not the prompt semantics.
+
+**The sanitizer must be re-wired by hand in any revert.** It is only *called* by the new
+builder, so reverting the format change silently unwires it and re-opens the injection. A
+revert commit must add the `_sanitize_context(context)` call back into the restored
+hand-written builder — one line, and the whole point of keeping the sanitizer in its own
+commit. Language validation lives in `_normalize_language_name` and survives a revert
+untouched.
