@@ -360,9 +360,13 @@ CONDITIONS = ("none", "hotwords", "sentence", "topic")
 # rule fails ~half the time on truly identical wordings.
 HIT_RATE_TOLERANCE = 0.10
 
-# Float artifact guard: 0.80 - 0.10 == 0.7000000000000001, so a candidate at
-# exactly the documented band edge (80% -> 70%) would block against the stated
-# ">= baseline - 0.10" rule. Round the threshold before comparing.
+# Float artifact guard: BOTH sides of the band comparison need rounding.
+# The threshold side: 0.80 - 0.10 == 0.7000000000000001. The candidate side:
+# avg() accumulates error, e.g. (0.70 + 0.70 + 0.70) / 3 == 0.6999999999999998,
+# so a multi-clip candidate at exactly the documented band edge (80% -> 70%)
+# would block against the stated ">= baseline - 0.10" rule. A single-clip run
+# has no accumulation error, which masks the bug in small-fixture tests —
+# real runs (>= 10 clips) hit it. Round both sides before comparing.
 _BAND_EPSILON_PLACES = 9
 
 
@@ -622,7 +626,9 @@ def cmd_compare(args: argparse.Namespace) -> int:
             if new_leak > old_leak:
                 verdict_pass = False
                 marker += "  <-- BLOCKING: leak rate increased (context echoed into transcript)"
-            if new_hit < round(old_hit - HIT_RATE_TOLERANCE, _BAND_EPSILON_PLACES):
+            if round(new_hit, _BAND_EPSILON_PLACES) < round(
+                old_hit - HIT_RATE_TOLERANCE, _BAND_EPSILON_PLACES
+            ):
                 verdict_pass = False
                 marker += "  <-- BLOCKING: hit rate dropped beyond the 10pp band"
         print(
