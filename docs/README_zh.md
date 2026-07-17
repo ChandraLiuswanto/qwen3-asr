@@ -282,7 +282,7 @@ curl -X POST "http://localhost:8000/v1/audio/transcriptions" \
 | `sample_rate`                | int    | `16000`          | 采样率                                |
 | `enable_speaker_diarization` | bool   | `true`           | 启用说话人分离                        |
 | `word_timestamps`            | bool   | `false`          | 返回后端支持的字词级时间戳；Qwen CUDA vLLM 与 CPU Rust 在启用时会自动调用 forced aligner |
-| `vocabulary_id`              | string | -                  | 无权重热词上下文（如：`词1 词2`）。**Deprecated：** 数字权重不受支持，传入时会被忽略。 |
+| `vocabulary_id`              | string | -                  | 辅助识别的自由文本背景上下文——主题、领域、场景或专有名词；空格分隔的热词列表（如：`词1 词2`）仍然有效。**Deprecated：** 数字权重不受支持，传入时会被忽略。 |
 
 **使用示例:**
 
