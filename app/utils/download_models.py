@@ -184,6 +184,9 @@ def download_models(
     """
     import shutil
 
+    # Called unconditionally on purpose -- do NOT guard this behind `if export_dir`.
+    # `python -m app.utils.download_models` never runs bootstrap, so this is the
+    # only place a bad MODEL_PATH_* is validated on the plain-download path.
     overrides = get_model_path_overrides()
     if export_dir and overrides:
         print("❌ --export-dir cannot be combined with MODEL_PATH overrides.")

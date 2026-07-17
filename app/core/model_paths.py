@@ -176,7 +176,12 @@ def is_overridden(model_id: Optional[str]) -> bool:
 
 
 def reset_override_cache() -> None:
-    """Drop the cached map. For tests and for bootstrap re-validation."""
+    """Drop the cached map. For tests only.
+
+    Production never resets: the map is built once from the environment, which
+    does not change after startup, and bootstrap validates by consulting it
+    rather than by rebuilding it.
+    """
     global _cache
     with _cache_lock:
         _cache = None
