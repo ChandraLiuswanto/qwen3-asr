@@ -23,8 +23,11 @@ class ThreadedEnginePoolTest(unittest.TestCase):
         self.assertEqual(build_log, [])  # lazy: nothing built yet
         pool.warmup()
         self.assertEqual(len(build_log), 3)
-        # Sequential under the init lock: all built on one thread.
-        self.assertEqual(len(set(build_log)), 1)
+        # Sequential under the init lock: all built on THIS thread. Comparing
+        # against the caller's ident (which cannot be reused while this test
+        # thread is alive) makes concurrent-build mutations fail
+        # deterministically instead of flakily.
+        self.assertEqual(set(build_log), {threading.get_ident()})
 
     def test_warmup_is_idempotent(self) -> None:
         count = [0]
@@ -58,8 +61,27 @@ class ThreadedEnginePoolTest(unittest.TestCase):
 
     def test_size_floor_is_one(self) -> None:
         pool = ThreadedEnginePool(0, object)
+        # Assert the floor BEFORE any acquire: if the floor is removed, a
+        # size-0 pool's acquire() blocks forever, hanging the suite instead
+        # of failing it.
+        self.assertEqual(pool.size, 1)
         pool.warmup()
         self.assertIsNotNone(pool.acquire())
+
+    def test_release_before_any_acquire_raises(self) -> None:
+        # release() must never lazily construct the pool: an engine can only
+        # come from acquire(), so this is caller misuse.
+        pool = ThreadedEnginePool(1, object)
+        with self.assertRaises(RuntimeError):
+            pool.release(object())
+
+    def test_release_into_full_pool_raises_queue_full(self) -> None:
+        # release() must never block: over-filling a size-1 pool fails loudly.
+        pool = ThreadedEnginePool(1, object)
+        engine = pool.acquire()
+        pool.release(engine)
+        with self.assertRaises(queue.Full):
+            pool.release(engine)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 # Diarization Throughput — Implementation Plan
 
 Date: 2026-07-17
-Status: awaiting approval
+Status: approved — Tasks 1-6 implemented on feat/diarization-throughput; Tasks 7-8 (H100) pending
 
 **Design spec (the what/why this plan implements):** [`docs/superpowers/specs/2026-07-17-diarization-throughput-design.md`](../specs/2026-07-17-diarization-throughput-design.md)
 
@@ -11,7 +11,7 @@ Status: awaiting approval
 
 **Goal:** Implement Change 1 (thread-local `torch.cuda.empty_cache` guard) and Change 2 (pool of N CAM++ pipeline instances), preserving per-instance serialization, with the H100 VRAM measurement gating the production pool size.
 
-**Architecture:** A `queue.Queue`-backed thread-safe pool class (`ThreadedEnginePool`, twin of `LocalEnginePool`) lives beside the existing async pool. `app/utils/speaker_diarizer.py` builds N pipeline instances sequentially under the existing `_diarization_pipeline_lock`, each patched with `_enable_batched_sv`; the request path checks an instance out (that checkout IS the mutex) and back in via try/finally. The `empty_cache` guard is a process-wide wrapper installed idempotently, skipping only on threads that set a `threading.local` flag for the duration of a diarization call.
+**Architecture:** A `queue.Queue`-backed thread-safe pool class (`ThreadedEnginePool`, twin of `LocalEnginePool`) lives beside the existing async pool. `app/utils/speaker_diarizer.py` builds N pipeline instances sequentially, sequenced by the pool's own init lock (`ThreadedEnginePool._init_lock`) — `_diarization_pipeline_lock` is used only by the one-time `_install_empty_cache_guard` install, which must not be called while it is held (corrected in review: an earlier draft claimed construction ran under `_diarization_pipeline_lock`, which would deadlock with the guard install) — each patched with `_enable_batched_sv`; the request path checks an instance out (that checkout IS the mutex) and back in via try/finally. The `empty_cache` guard is a process-wide wrapper installed idempotently, skipping only on threads that set a `threading.local` flag for the duration of a diarization call.
 
 **Tech Stack:** Python stdlib (`queue`, `threading`, `contextlib`), torch, modelscope/funasr (already in `.venv`), `unittest` (NOT pytest).
 
@@ -19,7 +19,7 @@ Status: awaiting approval
 
 - Dev box is a **non-CUDA AMD APU**: vLLM does not install, real diarization cannot run, VRAM/performance cannot be measured locally. Every step below is tagged **[LOCAL]** or **[H100-ONLY]**. Do not attempt an [H100-ONLY] step on the dev box.
 - Local unit tests use fakes and verify **STRUCTURE ONLY** (checkout semantics, idempotence, config validation, warmup counts). They prove nothing about real concurrency, VRAM, or throughput. Only the H100 tasks validate behavior.
-- Test runner: `DEVICE=cpu .venv/bin/python -m unittest discover -s tests` — currently GREEN at **127 tests**; must stay green (test count will grow).
+- Test runner: `DEVICE=cpu .venv/bin/python -m unittest discover -s tests` — currently GREEN at **134 tests** (corrected: plan was written against a stale count of 127); must stay green (test count will grow).
 - Per-instance serialization is load-bearing (spec §"The mutex is load-bearing"). No task may allow one pipeline instance to be visible to two concurrent requests.
 - Diarization stays synchronous. Do NOT make `SpeakerDiarizer.diarize` or anything under it async.
 - Do NOT hardcode the production pool size on faith: default `DIARIZATION_POOL_SIZE=4` in code, but the **production value is gated on Task 7's measured VRAM delta** (spec §"Change 2", blocking step).
@@ -142,7 +142,7 @@ Also add a matching one-line comment at `VLLM_OFFLINE_CONCURRENCY`'s definition 
 - [ ] **Step 4: Run tests**
 
 Run: `DEVICE=cpu .venv/bin/python -m unittest tests.test_diarization_pool_config -v` → PASS
-Run: `DEVICE=cpu .venv/bin/python -m unittest discover -s tests` → all green (127 + 4 new).
+Run: `DEVICE=cpu .venv/bin/python -m unittest discover -s tests` → all green (134 + 4 new = 138) (corrected: plan was written against a stale count of 127).
 
 ---
 
@@ -154,7 +154,7 @@ Run: `DEVICE=cpu .venv/bin/python -m unittest discover -s tests` → all green (
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `ThreadedEnginePool(size: int, factory: Callable[[], T])` with synchronous `warmup() -> None`, `acquire() -> T`, `release(engine: T) -> None`, and `size` property. Task 4 consumes it. Construction of instances happens inside `_ensure_state` under the init lock — i.e. **sequential**, which is exactly what the spec's "construction must be sequential" requires as long as the factory itself does the modelscope work.
+- Produces: `ThreadedEnginePool(size: int, factory: Callable[[], T])` with synchronous `warmup() -> None`, `acquire() -> T`, `release(engine: T) -> None`, and `size` property. Task 4 consumes it. Construction of instances happens inside `_ensure_queue` under the init lock — i.e. **sequential**, which is exactly what the spec's "construction must be sequential" requires as long as the factory itself does the modelscope work.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -705,7 +705,7 @@ with:
 - [ ] **Step 3: Run the full suite**
 
 Run: `DEVICE=cpu .venv/bin/python -m unittest discover -s tests`
-Expected: ALL green, including `test_preload_models_config_repair` and every Task 1-4 test (127 originals + ~14 new). If anything else red, fix before proceeding — the suite green is a hard gate.
+Expected: ALL green, including `test_preload_models_config_repair` and every Task 1-4 test (134 originals + 19 new = 153; corrected: plan was written against a stale count of 127). If anything else red, fix before proceeding — the suite green is a hard gate.
 
 - [ ] **Step 4: Import smoke check**
 
@@ -736,6 +736,8 @@ Spec §"Change 2": *"VRAM per instance is UNMEASURED — measure it on the H100 
 
 - [ ] **Step 2: Measure the per-instance delta.** With the service STOPPED (so vLLM isn't confounding), on the H100:
 
+Because the first instance's delta includes the one-time CUDA context, the script ALSO builds a second instance in the same process and records its (marginal) delta — that marginal number is the true per-additional-instance cost. It then runs one real diarization call (`p(path_to_2min_wav)`) at the production `DIARIZATION_SV_BATCH_SIZE` (128) before the final reading, so activation/allocator peak is included. All of this happens in ONE process — a fresh interpreter would lose the already-built instances and the CUDA context, so the steps must not be split across separate runs:
+
 ```bash
 # scratch script: measure_diarization_vram.py (run with the service venv)
 export DIARIZATION_POOL_SIZE=1
@@ -757,19 +759,22 @@ after_build = used_mib()
 print(f"before={before} MiB  after_build={after_build} MiB  "
       f"delta={after_build - before} MiB (includes CUDA context + throwaway "
       f"duplicate SV pipeline from SegmentationClusteringPipeline.__init__)")
-EOF
-```
 
-Then, because the first instance's delta includes the one-time CUDA context, ALSO build a second instance in the same process and record its (marginal) delta — that marginal number is the true per-additional-instance cost:
-
-```python
+# Second instance, same process: marginal = true per-additional-instance cost
+# (the first delta above includes the one-time CUDA context).
 before2 = used_mib()
 p2 = _build_diarization_pipeline()
 torch.cuda.synchronize()
 print(f"marginal per-instance delta = {used_mib() - before2} MiB")
-```
 
-Run one real diarization call (`p(path_to_2min_wav)`) at the production `DIARIZATION_SV_BATCH_SIZE` (128) before the final reading, so activation/allocator peak is included.
+# One real diarization call at production DIARIZATION_SV_BATCH_SIZE (128) so
+# the final reading includes the activation/allocator peak.
+# EDIT the path below on the H100 before running:
+# p(path_to_2min_wav)
+torch.cuda.synchronize()
+print(f"final used = {used_mib()} MiB (after real call: includes activation peak)")
+EOF
+```
 
 - [ ] **Step 3: Compute available headroom.** Record what vLLM + the forced aligner already reserve: `nvidia-smi` with the FULL service running (pool size 1). Headroom = 80GB card − reserved − safety margin (≥10%).
 

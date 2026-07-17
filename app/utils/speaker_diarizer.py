@@ -409,12 +409,15 @@ class SpeakerDiarizer:
             # until release. funasr mutates instance state per call, so the
             # instance must not be shared; the finally makes leaks impossible
             # even when the pipeline raises (e.g. "too short" audio).
-            pipeline = _diarization_pool.acquire()
+            # Bind the pool once: a module reload rebinds the global, and
+            # acquire/release must target the same pool object.
+            pool = _diarization_pool
+            pipeline = pool.acquire()
             try:
                 with _suppress_empty_cache():
                     result = pipeline(audio_path)
             finally:
-                _diarization_pool.release(pipeline)
+                pool.release(pipeline)
 
             # 解析结果: {'text': [[start, end, speaker_id], ...]}
             # pipeline 返回类型不确定，需要安全地获取 'text' 字段

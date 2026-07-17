@@ -1,7 +1,7 @@
 # Diarization Throughput — Design
 
 Date: 2026-07-17
-Status: awaiting approval
+Status: approved — Tasks 1-6 implemented on feat/diarization-throughput; Tasks 7-8 (H100) pending
 Scope: two changes — (1) stop funasr's per-call `torch.cuda.empty_cache()`, (2) pool the CAM++ pipeline.
 
 ## Spec
@@ -95,7 +95,7 @@ Replace the one global instance + global mutex with N independent instances. An 
 
 **`LocalEnginePool` cannot be reused as-is.** It is `asyncio.Queue`-backed (`app/services/asr/runtime/local_pool.py:19-48`), but diarization is called **synchronously from a worker thread** (`app/services/asr/engines/base.py:193`, inside `run_sync`). It needs a `queue.Queue`-backed thread-safe twin of the same shape (lazy init under a lock, `acquire`/`release`, `warmup`). Mirror the existing pattern; do not make diarization async.
 
-**Construction must be sequential.** modelscope `pipeline()` touches global registries, reads config files, and may download models on first run — building N concurrently is a race. Construct all N at warmup under the existing `_diarization_pipeline_lock`, each followed by `_enable_batched_sv`. Lazy child-pipeline creation inside the pipeline (`preprocess:179`, `postprocess:132`) is already neutralized because `_enable_batched_sv` pre-creates all three children.
+**Construction must be sequential.** modelscope `pipeline()` touches global registries, reads config files, and may download models on first run — building N concurrently is a race. Construct all N at warmup sequenced by the pool's own init lock (`ThreadedEnginePool._init_lock`), each followed by `_enable_batched_sv`; `_diarization_pipeline_lock` is used only by the one-time `_install_empty_cache_guard` install, which must not be called while that lock is held. (Corrected in review: an earlier draft said construction ran under `_diarization_pipeline_lock` — that would deadlock with the guard install the factory performs.) Lazy child-pipeline creation inside the pipeline (`preprocess:179`, `postprocess:132`) is already neutralized because `_enable_batched_sv` pre-creates all three children.
 
 **VRAM per instance is UNMEASURED — measure it on the H100 before fixing N. This is a blocking step, not a formality.**
 

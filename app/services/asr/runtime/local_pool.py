@@ -60,6 +60,11 @@ class ThreadedEnginePool(Generic[T]):
     Invariant (see DIARIZATION_POOL_SIZE in app/core/config.py): a blocking
     ``acquire()`` holds its executor-thread slot while waiting, so the number
     of concurrent callers must not exceed the pool size.
+
+    Release contract: ``release`` never constructs the pool and never blocks.
+    Releasing before any acquire is caller misuse and raises ``RuntimeError``;
+    releasing into an already-full pool raises ``queue.Full`` loudly instead
+    of wedging the calling thread forever.
     """
 
     def __init__(self, size: int, factory: Callable[[], T]):
@@ -92,4 +97,12 @@ class ThreadedEnginePool(Generic[T]):
         return self._ensure_queue().get()
 
     def release(self, engine: T) -> None:
-        self._ensure_queue().put(engine)
+        # Never construct the pool here: an engine can only exist via
+        # acquire(), so a missing queue means caller misuse.
+        q = self._queue
+        if q is None:
+            raise RuntimeError(
+                "ThreadedEnginePool.release() called before any acquire()"
+            )
+        # put_nowait: an over-full pool is a bug; fail loudly, never block.
+        q.put_nowait(engine)
