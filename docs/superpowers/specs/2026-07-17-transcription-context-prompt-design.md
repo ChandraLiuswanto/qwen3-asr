@@ -37,6 +37,11 @@ The narrowing is the whole problem. The wrapper sentence itself is load-bearing 
   that is a separate field and a separate spec.
 - **Whisper `prompt` parity.** Rejected below.
 - Touching `temperature` / `timestamp_granularities`, which genuinely are inert.
+- **The CPU/Rust backend.** This change lives in `qwen3_vllm.py` and is a no-op there.
+  Rust discards caller context outright (`qwen3_engine.py:234`,
+  `_ = (hotwords, enable_punctuation, sample_rate)`) and is not wired for `language`
+  either, though `qwenasr_rust.py:318` accepts it. So all three surfaces below gain the
+  new framing **on vLLM/CUDA only**. Deliberately out of scope.
 
 ## The convergence
 
