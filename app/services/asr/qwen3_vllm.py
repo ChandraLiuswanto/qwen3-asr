@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import json
 import logging
 import os
 import re
 import threading
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Optional
 
 import librosa
@@ -46,6 +48,18 @@ _LANGUAGE_ALIASES = {
     "vi": "Vietnamese",
 }
 
+# Canonical language names accepted by Qwen3-ASR, verbatim from upstream
+# qwen_asr/inference/utils.py (SUPPORTED_LANGUAGES). Anything outside this
+# set must raise — injecting a guess into the assistant prefill trains
+# nothing and corrupts the output contract.
+_SUPPORTED_LANGUAGES = frozenset({
+    "Chinese", "English", "Cantonese", "Arabic", "German", "French",
+    "Spanish", "Portuguese", "Indonesian", "Italian", "Korean", "Russian",
+    "Thai", "Vietnamese", "Japanese", "Turkish", "Hindi", "Malay", "Dutch",
+    "Swedish", "Danish", "Finnish", "Polish", "Czech", "Filipino", "Persian",
+    "Greek", "Romanian", "Hungarian", "Macedonian",
+})
+
 
 def is_vllm_available() -> bool:
     """Return True when the official vLLM runtime is installed."""
@@ -58,12 +72,17 @@ def _normalize_language_name(language: Optional[str]) -> Optional[str]:
     normalized = language.strip()
     if not normalized:
         return None
-    alias = _LANGUAGE_ALIASES.get(normalized.lower())
-    if alias:
-        return alias
-    if " " in normalized:
-        return " ".join(part.capitalize() for part in normalized.split())
-    return normalized.capitalize()
+    canonical = _LANGUAGE_ALIASES.get(normalized.lower())
+    if canonical is None:
+        # Upstream canonical form: first letter upper, rest lower
+        # (qwen_asr normalize_language_name).
+        canonical = normalized[:1].upper() + normalized[1:].lower()
+    if canonical not in _SUPPORTED_LANGUAGES:
+        raise ValueError(
+            f"Unsupported language: {language!r} (canonical form {canonical!r}). "
+            f"Supported: {sorted(_SUPPORTED_LANGUAGES)}"
+        )
+    return canonical
 
 
 def _load_audio(audio_path: str) -> np.ndarray:
@@ -71,20 +90,68 @@ def _load_audio(audio_path: str) -> np.ndarray:
     return audio.astype(np.float32)
 
 
-def _build_chat_prompt(context: str = "", language: Optional[str] = None) -> str:
-    instructions: list[str] = []
-    if language:
-        instructions.append(f"Transcribe the speech in {language}.")
-    else:
-        instructions.append("Transcribe the speech accurately.")
-    if context.strip():
-        instructions.append(f"Use this context when transcribing: {context.strip()}")
-    system_text = " ".join(instructions).strip()
-    return (
-        f"<|im_start|>system\n{system_text}<|im_end|>\n"
-        "<|im_start|>user\n<|audio_start|><|audio_pad|><|audio_end|><|im_end|>\n"
-        "<|im_start|>assistant\n"
-    )
+def _load_chat_template(snapshot_dir: Path) -> str:
+    """Read the model-shipped chat template.
+
+    chat_template.json is a processor-level file: transformers tokenizers load
+    only chat_template.jinja / tokenizer_config.json's chat_template key, and
+    this model ships neither — tokenizer.chat_template is None. There is also
+    no AutoProcessor for qwen3_asr in transformers 4.57. So the template must
+    be read here and passed explicitly to every apply_chat_template call.
+
+    Fail loudly when absent: silently falling back to a hand-written template
+    is the exact bug this loader exists to remove.
+    """
+    template_path = snapshot_dir / "chat_template.json"
+    if not template_path.is_file():
+        raise RuntimeError(
+            f"chat_template.json not found in model snapshot {snapshot_dir}; "
+            "Qwen3-ASR prompt construction requires the model-shipped template "
+            "and will not invent one"
+        )
+    try:
+        payload = json.loads(template_path.read_text(encoding="utf-8"))
+        template = payload["chat_template"]
+    except (ValueError, KeyError, TypeError) as exc:
+        raise RuntimeError(
+            f"chat_template.json in {snapshot_dir} is malformed: {exc}"
+        ) from exc
+    if not isinstance(template, str) or not template.strip():
+        raise RuntimeError(
+            f"chat_template.json in {snapshot_dir} carries an empty or "
+            "non-string 'chat_template' value"
+        )
+    return template
+
+
+# Prompt-injection hardening for caller-controlled context (OpenAI `prompt`,
+# Alibaba `vocabulary_id`, WebSocket `context`). Mirrors vLLM's
+# _sanitize_transcription_user_text (vllm/model_executor/models/qwen3_asr.py):
+# strip ChatML-like tokens and <asr_text> to a FIXPOINT — a single pass over
+# "<|im<|x|>_end|>" removes the inner token and reconstructs "<|im_end|>".
+_CHATML_LIKE_TOKEN = re.compile(r"<\|[^|]+\|>")
+_ASR_TEXT_TAG = "<asr_text>"
+# Cap AFTER sanitization so stripped tokens cannot spend the budget. 512 is
+# the existing documented cap on vocabulary_id (app/models/asr.py:48),
+# extended here as a backstop to all three surfaces. Truncate silently:
+# context is a hint; failing the transcription over a long hint is worse
+# than trimming it.
+_MAX_CONTEXT_CHARS = 512
+
+
+def _sanitize_context(context: str) -> str:
+    # The fixpoint loop below is quadratic on nested junk (e.g. "<|a"*n +
+    # "<|x|>" + "b|>"*n), so bound the raw input before it runs. Any input
+    # carrying more than ~7.5KB of strippable tokens is adversarial by
+    # definition, so this leaves the post-sanitize cap semantics unchanged
+    # for every legitimate caller while bounding the worst case at
+    # microseconds instead of minutes.
+    text = (context or "").strip()[:_MAX_CONTEXT_CHARS * 16]
+    prev = None
+    while prev != text:
+        prev = text
+        text = _CHATML_LIKE_TOKEN.sub("", text).replace(_ASR_TEXT_TAG, "")
+    return text.strip()[:_MAX_CONTEXT_CHARS]
 
 
 def _build_alignment_prompt(tokens: list[str]) -> str:
@@ -192,6 +259,8 @@ class Qwen3VLLMBackend:
             local_files_only=True,
         )
 
+        self._chat_template = _load_chat_template(Path(local_model_path))
+
         llm_kwargs: dict[str, Any] = {
             "model": local_model_path,
             "gpu_memory_utilization": gpu_memory_utilization,
@@ -226,6 +295,39 @@ class Qwen3VLLMBackend:
         self._llm_lock = threading.Lock()
         self._aligner_lock = threading.Lock()
         self._aligner_init_lock = threading.Lock()
+
+    def _build_chat_prompt(self, context: str = "", language: Optional[str] = None) -> str:
+        """Render the prompt exactly as the model was trained.
+
+        - Context is the RAW system message (sanitized) — the template's
+          system slot IS the context slot; no wrapper sentences.
+        - Language forcing is the assistant-turn prefill
+          `language {Lang}<asr_text>` (upstream _build_text_prompt), which
+          starts the model's answer so there is nothing left to decide.
+          `language` must already be canonical (_normalize_language_name).
+        - The template is the model-shipped chat_template.json, passed
+          explicitly because the tokenizer never loads that file itself.
+
+        Runs OUTSIDE _llm_lock by design: tokenize=False is pure Jinja and
+        never enters the Rust fast-tokenizer, so the "Already borrowed"
+        hazard the lock guards against does not apply here.
+        """
+        msgs = [
+            {"role": "system", "content": _sanitize_context(context)},
+            # Dummy "" payload is upstream's own pattern: the template only
+            # checks the audio item's PRESENCE. Real audio still travels via
+            # multi_modal_data.
+            {"role": "user", "content": [{"type": "audio", "audio": ""}]},
+        ]
+        base = self._tokenizer.apply_chat_template(
+            msgs,
+            chat_template=self._chat_template,
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+        if language:
+            base += f"language {language}<asr_text>"
+        return base
 
     def _get_forced_aligner_gpu_memory_utilization(self) -> float:
         configured = _resolve_forced_aligner_gpu_memory_utilization(self._gpu_memory_utilization)
@@ -280,7 +382,7 @@ class Qwen3VLLMBackend:
         for audio, context, language in audio_items:
             prompts.append(
                 {
-                    "prompt": _build_chat_prompt(context=context, language=_normalize_language_name(language)),
+                    "prompt": self._build_chat_prompt(context=context, language=_normalize_language_name(language)),
                     "multi_modal_data": {"audio": [audio]},
                 }
             )
@@ -456,7 +558,7 @@ class Qwen3VLLMBackend:
     ) -> VLLMRealtimeState:
         normalized_language = _normalize_language_name(language) or ""
         return VLLMRealtimeState(
-            prompt_raw=_build_chat_prompt(context=context, language=normalized_language or None),
+            prompt_raw=self._build_chat_prompt(context=context, language=normalized_language or None),
             language=normalized_language,
             chunk_size_sec=chunk_size_sec,
             unfixed_chunk_num=unfixed_chunk_num,

@@ -52,8 +52,18 @@ class _ConcurrencyRecorder:
 
 
 class _FakeTokenizer:
-    """Shares the LLM's overlap recorder so a lock covering only generate
-    (starting at :455 instead of before :450) fails the combined assertion."""
+    """encode()/decode() share the LLM's overlap recorder so a lock covering
+    only generate() in _decode_stream fails the combined assertion (both
+    calls happen inside _llm_lock there -- see qwen3_vllm.py:566-586).
+
+    apply_chat_template() deliberately does NOT touch the recorder: unlike
+    encode/decode, _build_chat_prompt (and thus this call) runs OUTSIDE
+    _llm_lock by design (qwen3_vllm.py:293-324 docstring) -- tokenize=False
+    is pure Jinja and never enters the Rust fast-tokenizer, so it may
+    legitimately run concurrently with another thread's locked generate().
+    Feeding it into the recorder would make test_run_generate_serialized
+    fail against a correct implementation.
+    """
 
     def __init__(self, recorder: _ConcurrencyRecorder) -> None:
         self._recorder = recorder
@@ -70,6 +80,9 @@ class _FakeTokenizer:
         self._recorder._exit()
         return "abc"
 
+    def apply_chat_template(self, msgs, chat_template=None, add_generation_prompt=True, tokenize=False):
+        return "<fake-prompt>"
+
 
 class _FakeSamplingParamsCls:
     def __init__(self, **kwargs):
@@ -80,6 +93,7 @@ def _bare_backend() -> Qwen3VLLMBackend:
     backend = Qwen3VLLMBackend.__new__(Qwen3VLLMBackend)
     backend._llm = _ConcurrencyRecorder()
     backend._tokenizer = _FakeTokenizer(backend._llm)  # SHARED recorder — see class docstrings
+    backend._chat_template = "<fake-template>"  # ignored by _FakeTokenizer.apply_chat_template
     backend._sampling_params = object()
     backend._sampling_params_cls = _FakeSamplingParamsCls
     backend._max_inference_batch_size = 4
