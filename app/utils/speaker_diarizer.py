@@ -8,6 +8,7 @@ from loguru import logger
 import numpy as np
 import librosa
 import soundfile as sf
+import contextlib
 import tempfile
 import os
 import threading
@@ -23,6 +24,51 @@ from ..core.exceptions import DefaultServerErrorException
 _global_diarization_pipeline: Any | None = None
 _diarization_pipeline_lock = threading.Lock()
 _diarization_inference_semaphore = threading.BoundedSemaphore(1)
+
+# --- torch.cuda.empty_cache guard -------------------------------------------
+# funasr runs `torch.cuda.empty_cache()` after EVERY inference
+# (funasr/auto/auto_model.py:410-417): a device sync plus an allocator flush
+# on the same GPU vLLM is using, inside our per-request diarization critical
+# path. `empty_cache` is resolved at call time as `torch.cuda.empty_cache`,
+# so it cannot be patched per-module; instead we install ONE wrapper that
+# skips only when the calling thread is inside a diarization call.
+# Thread-local, not a module flag: diarization runs on executor threads while
+# other threads use CUDA concurrently.
+_empty_cache_tls = threading.local()
+_empty_cache_guard_installed = False
+
+
+def _install_empty_cache_guard() -> None:
+    """Wrap torch.cuda.empty_cache once. Idempotent: never nests wrappers."""
+    global _empty_cache_guard_installed
+    with _diarization_pipeline_lock:
+        if _empty_cache_guard_installed or getattr(
+            torch.cuda.empty_cache, "_diarization_guard", False
+        ):
+            _empty_cache_guard_installed = True
+            return
+
+        real_empty_cache = torch.cuda.empty_cache
+
+        def _guarded_empty_cache() -> None:
+            if getattr(_empty_cache_tls, "skip", False):
+                return
+            real_empty_cache()
+
+        _guarded_empty_cache._diarization_guard = True  # type: ignore[attr-defined]
+        torch.cuda.empty_cache = _guarded_empty_cache
+        _empty_cache_guard_installed = True
+        logger.info("已安装 torch.cuda.empty_cache 线程局部守卫（跳过 diarization 内的调用）")
+
+
+@contextlib.contextmanager
+def _suppress_empty_cache():
+    """Skip torch.cuda.empty_cache on THIS thread for the duration."""
+    _empty_cache_tls.skip = True
+    try:
+        yield
+    finally:
+        _empty_cache_tls.skip = False
 
 
 @dataclass
