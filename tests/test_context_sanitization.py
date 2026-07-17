@@ -7,6 +7,8 @@ inner token can reconstruct an outer one. The fixpoint tests here are the
 load-bearing ones: a single-pass implementation must fail them.
 """
 
+import re
+import time
 import unittest
 
 from app.services.asr.qwen3_vllm import _MAX_CONTEXT_CHARS, _sanitize_context
@@ -55,6 +57,28 @@ class SanitizeContextTest(unittest.TestCase):
         # text must keep the real text.
         payload = "<|junk|>" * 75 + "keep me"      # 600 chars of tokens + text
         self.assertEqual(_sanitize_context(payload), "keep me")
+
+    def test_large_nested_payload_is_capped_before_fixpoint_loop(self) -> None:
+        # Nested adversarial payloads make the fixpoint loop O(n^2): without
+        # a pre-cap on the raw input, a ~280KB payload extrapolates to
+        # 20s+ single-threaded (measured: 60KB ~ 1s). Two caller surfaces
+        # are uncapped upstream (OpenAI `prompt` form field; WS `context`,
+        # which reaches the event loop synchronously), so this must stay
+        # fast regardless of how large the raw input is.
+        payload = "<|a" * 40000 + "<|x|>" + "b|>" * 40000  # ~280KB
+        start = time.monotonic()
+        result = _sanitize_context(payload)
+        elapsed = time.monotonic() - start
+        # The pre-cap truncates raw input before the "<|x|>" payoff is ever
+        # reached, so the retained prefix can contain a dangling, unclosed
+        # "<|" fragment. That is harmless (it can never tokenize as a real
+        # control token, which requires the exact closed string
+        # "<|...|>"): what must never survive is a COMPLETE ChatML-like
+        # token or the <asr_text> tag.
+        self.assertIsNone(re.search(r"<\|[^|]+\|>", result))
+        self.assertNotIn("<asr_text>", result)
+        self.assertLessEqual(len(result), _MAX_CONTEXT_CHARS)
+        self.assertLess(elapsed, 1.0)
 
 
 if __name__ == "__main__":

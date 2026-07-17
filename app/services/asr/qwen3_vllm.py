@@ -140,7 +140,13 @@ _MAX_CONTEXT_CHARS = 512
 
 
 def _sanitize_context(context: str) -> str:
-    text = (context or "").strip()
+    # The fixpoint loop below is quadratic on nested junk (e.g. "<|a"*n +
+    # "<|x|>" + "b|>"*n), so bound the raw input before it runs. Any input
+    # carrying more than ~7.5KB of strippable tokens is adversarial by
+    # definition, so this leaves the post-sanitize cap semantics unchanged
+    # for every legitimate caller while bounding the worst case at
+    # microseconds instead of minutes.
+    text = (context or "").strip()[:_MAX_CONTEXT_CHARS * 16]
     prev = None
     while prev != text:
         prev = text
