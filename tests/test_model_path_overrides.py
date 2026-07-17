@@ -241,27 +241,58 @@ class ResolutionWithOverridesTest(unittest.TestCase):
         self.addCleanup(model_paths.reset_override_cache)
 
     def test_modelscope_override_wins_over_cache(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            model_dir = _make_model_dir(temp_dir, "vad")
-            with mock.patch.dict(os.environ, {"MODEL_PATH_VAD": model_dir}, clear=True):
-                resolved = resolve_model_path(_VAD_ID)
+        # The ModelScope cache genuinely contains the VAD model, so this only
+        # passes if the override is consulted BEFORE the cache lookup.
+        with tempfile.TemporaryDirectory() as cache_dir, tempfile.TemporaryDirectory() as override_root:
+            cache_model_dir = _make_model_dir(cache_dir, _VAD_ID)
+            model_dir = _make_model_dir(override_root, "vad")
+            self.assertTrue(Path(cache_model_dir).is_dir())
+
+            with mock.patch.object(settings, "MODELSCOPE_PATH", cache_dir):
+                with mock.patch.dict(
+                    os.environ, {"MODEL_PATH_VAD": model_dir}, clear=True
+                ):
+                    resolved = resolve_model_path(_VAD_ID)
 
             self.assertEqual(resolved, str(Path(model_dir).resolve()))
+            self.assertNotEqual(resolved, cache_model_dir)
 
     def test_without_override_modelscope_resolution_is_unchanged(self) -> None:
-        with mock.patch.dict(os.environ, {}, clear=True):
-            resolved = resolve_model_path(_VAD_ID)
+        # With no override set, the ModelScope cache entry is returned exactly
+        # as it is today.
+        with tempfile.TemporaryDirectory() as cache_dir:
+            cache_model_dir = _make_model_dir(cache_dir, _VAD_ID)
 
-        # No override and (in a clean test env) no cache entry: falls through to
-        # the bare id exactly as it does today.
-        self.assertIn(resolved, {_VAD_ID, str(Path(settings.MODELSCOPE_PATH) / _VAD_ID)})
+            with mock.patch.object(settings, "MODELSCOPE_PATH", cache_dir):
+                with mock.patch.dict(os.environ, {}, clear=True):
+                    resolved = resolve_model_path(_VAD_ID)
+
+            self.assertEqual(resolved, cache_model_dir)
 
     def test_huggingface_override_returns_flat_dir(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            model_dir = _make_model_dir(temp_dir, "qwen")
+        # The HF cache genuinely contains a resolvable snapshot for the model,
+        # so this only passes if the override is consulted BEFORE the cache.
+        with tempfile.TemporaryDirectory() as cache_dir, tempfile.TemporaryDirectory() as override_root:
+            base_dir = Path(cache_dir) / "models--Qwen--Qwen3-ASR-1.7B"
+            snapshot_name = "abc123def456"
+            snapshot_dir = base_dir / "snapshots" / snapshot_name
+            snapshot_dir.mkdir(parents=True)
+            (snapshot_dir / "config.json").write_text("{}", encoding="utf-8")
+            refs_dir = base_dir / "refs"
+            refs_dir.mkdir(parents=True)
+            (refs_dir / "main").write_text(snapshot_name, encoding="utf-8")
+
+            model_dir = _make_model_dir(override_root, "qwen")
+
             with mock.patch.dict(
-                os.environ, {"MODEL_PATH_QWEN3_ASR_1_7B": model_dir}, clear=True
+                os.environ,
+                {
+                    "MODEL_PATH_QWEN3_ASR_1_7B": model_dir,
+                    "HF_HUB_CACHE": cache_dir,
+                },
+                clear=True,
             ):
                 resolved = find_huggingface_snapshot_dir("Qwen/Qwen3-ASR-1.7B")
 
             self.assertEqual(resolved, Path(model_dir).resolve())
+            self.assertNotEqual(resolved, snapshot_dir.resolve())
