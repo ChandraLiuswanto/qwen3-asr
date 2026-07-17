@@ -799,3 +799,14 @@ Depends on Task 7's N. All spec §"Success criteria" items checked here.
 - All three `get_global_diarization_pipeline` call sites are moved: request path (Task 4c), warmup (Task 5.1), test patch (Task 5.2); the symbol is deleted and its absence asserted (Task 4 test).
 - Known transient red between Task 4 and Task 5 is called out; suite-green is gated at end of Task 5.
 - Local tests are labeled structure-only in their own docstrings; nothing local claims concurrency proof.
+
+---
+
+### Post-review amendments (final whole-branch review, 2026-07-17)
+
+- **Task 6 narrowing, now explicit:** the instrumentation wraps `preprocess`/`forward`/`postprocess` (3 wrap points), not the spec's five named stages. Decision inputs survive: VAD≈preprocess, embed≈forward, change_locator is inside postprocess, clustering is spec-verified cheap; chunk+cluster residual = `diarization_s` − (sum of stages). **Collect the profile at n=1 only** — profile lines carry no request tag and interleave unattributably under concurrency.
+- **Task 8 additional operator watch items:**
+  1. A boot line "CAM++ 模型加载失败" is a HARD STOP: warmup failure is swallowed at boot, and the lazy fallback then builds all N instances from an executor thread on the first diarization request while holding an admission permit — serializing and stalling offline traffic, corrupting every measurement (tracked as a bd issue).
+  2. Expect ~N× longer boot (sequential builds). N × "CAM++ 模型加载成功" + exactly one guard-install line is the proof the pool is populated (Step 1 already requires this).
+  3. Run the Step 4 VRAM watch long enough to see the allocator plateau: with `empty_cache` suppressed on diarization threads, the CAM++ allocator cache grows to a steady state it never previously reached (N instances × batch-128 SV activations).
+  4. The boot warning for `VLLM_OFFLINE_CONCURRENCY <= DIARIZATION_POOL_SIZE` only sees the vLLM offline knob. Other engine families (FUNASR_WORKERS, QWEN_RUST_CPU_WORKERS, a second vLLM model id) add concurrent diarize callers it cannot see — re-derive the bound before adding families. Single-process deployment assumed; multiple uvicorn workers multiply pool VRAM by worker count on top of Task 7's arithmetic.
