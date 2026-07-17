@@ -11,6 +11,8 @@ from app.infrastructure.model_utils import (
     resolve_model_path,
 )
 from app.services.asr.model_capabilities import get_slugged_assets
+from app.utils.download_models import check_all_models
+from app.utils.model_loader import _build_required_model_integrity_specs
 
 
 class SluggedAssetsTest(unittest.TestCase):
@@ -296,3 +298,57 @@ class ResolutionWithOverridesTest(unittest.TestCase):
 
             self.assertEqual(resolved, Path(model_dir).resolve())
             self.assertNotEqual(resolved, snapshot_dir.resolve())
+
+
+class OverridesSkipStartupChecksTest(unittest.TestCase):
+    def setUp(self) -> None:
+        model_paths.reset_override_cache()
+        self.addCleanup(model_paths.reset_override_cache)
+        # Both checks route through the runtime model plan, which on a CPU box
+        # without the Rust extension resolves no Qwen model and raises. Pretend
+        # the extension is present so the plan is buildable under DEVICE=cpu.
+        patcher = mock.patch(
+            "app.services.asr.qwenasr_rust.is_qwenasr_rust_available",
+            return_value=True,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_overridden_model_is_not_integrity_checked(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = _make_model_dir(temp_dir, "vad")
+            with mock.patch.dict(os.environ, {"MODEL_PATH_VAD": model_dir}, clear=True):
+                specs = _build_required_model_integrity_specs()
+
+        descriptions = [spec.description for spec in specs]
+        self.assertNotIn("VAD", descriptions)
+
+    def test_non_overridden_models_are_still_integrity_checked(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            specs = _build_required_model_integrity_specs()
+
+        self.assertIn("VAD", [spec.description for spec in specs])
+
+    def test_overridden_model_is_not_reported_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = _make_model_dir(temp_dir, "vad")
+            with mock.patch.dict(os.environ, {"MODEL_PATH_VAD": model_dir}, clear=True):
+                missing_ids = [item[0] for item in check_all_models()]
+
+        self.assertNotIn(_VAD_ID, missing_ids)
+
+    def test_non_overridden_models_are_still_reported_missing(self) -> None:
+        # Forces every model to look absent from the cache so the assertion does
+        # not depend on what this machine has downloaded. Without this, an
+        # inverted guard (skipping the non-overridden models) would go unnoticed.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = _make_model_dir(temp_dir, "vad")
+            with mock.patch.dict(os.environ, {"MODEL_PATH_VAD": model_dir}, clear=True):
+                with mock.patch(
+                    "app.utils.download_models.check_model_exists",
+                    return_value=(False, ""),
+                ):
+                    missing_ids = [item[0] for item in check_all_models()]
+
+        self.assertNotIn(_VAD_ID, missing_ids)
+        self.assertIn("iic/punc_ct-transformer_zh-cn-common-vocab272727-pytorch", missing_ids)

@@ -17,6 +17,7 @@ from huggingface_hub import snapshot_download as hf_snapshot_download
 from modelscope.hub.snapshot_download import snapshot_download as ms_snapshot_download
 
 from app.core.config import settings
+from app.core.model_paths import is_overridden
 from app.infrastructure import (
     find_huggingface_snapshot_dir,
     get_huggingface_cache_root,
@@ -83,12 +84,16 @@ def check_all_models() -> list[tuple[str, str, str, Optional[str]]]:
 
     # Check ModelScope models.
     for asset in ms_assets:
+        if is_overridden(asset.model_id):
+            continue
         exists, _ = check_model_exists(asset.model_id, source="modelscope")
         if not exists:
             missing.append((asset.model_id, asset.description, "modelscope", asset.revision))
 
     # Check Hugging Face models. HF assets currently do not use pinned revisions.
     for asset in hf_assets:
+        if is_overridden(asset.model_id):
+            continue
         exists, _ = check_model_exists(asset.model_id, source="huggingface")
         if not exists:
             missing.append((asset.model_id, asset.description, "huggingface", None))
