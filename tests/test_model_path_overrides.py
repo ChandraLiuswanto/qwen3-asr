@@ -633,58 +633,120 @@ class ValidationFiresWithoutBootstrapTest(unittest.TestCase):
 
 
 class DotenvReachesEveryEntrypointTest(unittest.TestCase):
+    """Guards `load_dotenv()` living in app/core/config.py.
+
+    IMPORTANT — how python-dotenv actually resolves `.env`, and why this test
+    is built the way it is:
+
+    `load_dotenv()` -> `find_dotenv()` picks its search root one of two ways.
+    If `__main__` has no `__file__` (a REPL, or `python -c ...`), it treats the
+    process as interactive and searches upward from **os.getcwd()**. Otherwise
+    -- which is every real entrypoint: `python start.py`, `python -m
+    app.utils.download_models`, `uvicorn app.main:app` -- it searches upward
+    from the directory of the file that *called* `load_dotenv()`, i.e. from
+    `dirname(app/core/config.py)` up through `app/` to the repo root. So in
+    production, `.env` resolution is **config.py-relative and completely
+    independent of cwd**. A `.env` sitting in the cwd is NOT read.
+
+    Do not "simplify" this into a `python -c` subprocess: that silently flips
+    find_dotenv onto the interactive/cwd branch and tests a path production
+    never takes. Hence: the runner is a real script FILE (so `__main__.__file__`
+    exists), and it imports `app` through a symlinked fake repo root so the
+    upward walk lands on a temp `.env` we control. `os.path.abspath` does not
+    resolve symlinks, so config.py's apparent location -- and therefore the
+    walk -- stays inside the temp tree. That keeps the real repo untouched: no
+    `.env` is ever written into it.
+    """
+
+    def _run_import_in_fake_root(self, temp_dir: str, extra_env: dict) -> str:
+        """Import app.core.config from a script file, in a cwd far from the .env.
+
+        Layout:
+          <temp>/fake_root/.env      <- the "repo" .env; the ONLY one that may win
+          <temp>/fake_root/app       -> symlink to the real app package
+          <temp>/cwd/.env            <- decoy; production must ignore this
+          <temp>/runner.py           <- gives __main__ a __file__
+
+        Returns the subprocess's stdout (the resolved MODEL_PATH_VAD).
+        """
+        repo_root = Path(__file__).resolve().parent.parent
+        fake_root = Path(temp_dir) / "fake_root"
+        fake_root.mkdir(exist_ok=True)
+        (fake_root / "app").symlink_to(repo_root / "app")
+
+        runner = Path(temp_dir) / "runner.py"
+        runner.write_text(
+            "import app.core.config, os\n"
+            "print(os.getenv('MODEL_PATH_VAD'))\n",
+            encoding="utf-8",
+        )
+
+        env = {k: v for k, v in os.environ.items() if not k.startswith("MODEL_PATH_")}
+        env["PYTHONPATH"] = str(fake_root)
+        env.update(extra_env)
+
+        result = subprocess.run(
+            [sys.executable, str(runner)],
+            cwd=str(Path(temp_dir) / "cwd"),
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
+
+    def _write_env_files(self, temp_dir: str, repo_value: str, cwd_value: str) -> None:
+        (Path(temp_dir) / "cwd").mkdir()
+        (Path(temp_dir) / "cwd" / ".env").write_text(
+            f"MODEL_PATH_VAD={cwd_value}\n", encoding="utf-8"
+        )
+        (Path(temp_dir) / "fake_root").mkdir(exist_ok=True)
+        (Path(temp_dir) / "fake_root" / ".env").write_text(
+            f"MODEL_PATH_VAD={repo_value}\n", encoding="utf-8"
+        )
+
     def test_importing_settings_loads_dotenv(self) -> None:
-        # A subprocess with a .env in cwd and nothing in the environment: importing
-        # settings alone must make MODEL_PATH_VAD visible. This is what makes the
-        # standalone CLI and bare uvicorn honor .env at all.
+        # Importing settings alone -- no start.py -- must make MODEL_PATH_VAD
+        # visible. This is what makes the standalone CLI and bare uvicorn honor
+        # .env at all. Drop load_dotenv() from config.py and this prints None.
         with tempfile.TemporaryDirectory() as temp_dir:
-            model_dir = _make_model_dir(temp_dir, "vad")
-            (Path(temp_dir) / ".env").write_text(
-                f"MODEL_PATH_VAD={model_dir}\n", encoding="utf-8"
-            )
-            env = {
-                k: v for k, v in os.environ.items() if not k.startswith("MODEL_PATH_")
-            }
-            env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
+            repo_value = _make_model_dir(temp_dir, "vad-repo")
+            cwd_value = _make_model_dir(temp_dir, "vad-cwd")
+            self._write_env_files(temp_dir, repo_value, cwd_value)
 
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    "-c",
-                    "import app.core.config, os; print(os.getenv('MODEL_PATH_VAD'))",
-                ],
-                cwd=temp_dir,
-                env=env,
-                capture_output=True,
-                text=True,
+            resolved = self._run_import_in_fake_root(temp_dir, {})
+
+        # The repo's .env won; the one in cwd was never read. Both halves matter:
+        # equality proves load_dotenv ran, inequality proves it was not cwd-based.
+        self.assertEqual(resolved, repo_value)
+        self.assertNotEqual(resolved, cwd_value)
+
+    def test_dotenv_in_unrelated_cwd_is_ignored(self) -> None:
+        # No .env anywhere on config.py's upward walk, only one in the cwd.
+        # Production must resolve nothing -- pinning that cwd cannot inject
+        # config. (This test alone has no teeth against load_dotenv removal;
+        # test_importing_settings_loads_dotenv is the one that does.)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cwd_value = _make_model_dir(temp_dir, "vad-cwd")
+            (Path(temp_dir) / "cwd").mkdir()
+            (Path(temp_dir) / "cwd" / ".env").write_text(
+                f"MODEL_PATH_VAD={cwd_value}\n", encoding="utf-8"
             )
 
-        self.assertEqual(result.stdout.strip(), model_dir, result.stderr)
+            resolved = self._run_import_in_fake_root(temp_dir, {})
+
+        self.assertEqual(resolved, "None")
 
     def test_real_environment_wins_over_dotenv(self) -> None:
         # Docker sets `environment:` explicitly; load_dotenv must not override it.
         with tempfile.TemporaryDirectory() as temp_dir:
             from_dotenv = _make_model_dir(temp_dir, "vad-dotenv")
+            from_cwd = _make_model_dir(temp_dir, "vad-cwd")
             from_env = _make_model_dir(temp_dir, "vad-env")
-            (Path(temp_dir) / ".env").write_text(
-                f"MODEL_PATH_VAD={from_dotenv}\n", encoding="utf-8"
-            )
-            env = {
-                k: v for k, v in os.environ.items() if not k.startswith("MODEL_PATH_")
-            }
-            env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
-            env["MODEL_PATH_VAD"] = from_env
+            self._write_env_files(temp_dir, from_dotenv, from_cwd)
 
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    "-c",
-                    "import app.core.config, os; print(os.getenv('MODEL_PATH_VAD'))",
-                ],
-                cwd=temp_dir,
-                env=env,
-                capture_output=True,
-                text=True,
+            resolved = self._run_import_in_fake_root(
+                temp_dir, {"MODEL_PATH_VAD": from_env}
             )
 
-        self.assertEqual(result.stdout.strip(), from_env, result.stderr)
+        self.assertEqual(resolved, from_env)
