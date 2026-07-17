@@ -64,6 +64,22 @@ class BuildChatPromptTest(unittest.TestCase):
             "Use this context when transcribing: Danantara",
         )
 
+    def test_full_template_scaffold_pins_user_audio_and_assistant_turns(self) -> None:
+        # The other tests slice out only the system block, so a mutant that
+        # drops the user turn (with the <|audio_pad|> placeholder) or the
+        # trailing assistant turn would survive them. Pin the ENTIRE
+        # template here so the scaffold cannot silently regress.
+        prompt = _build_chat_prompt(context="Danantara", language="Indonesian")
+
+        self.assertEqual(
+            prompt,
+            "<|im_start|>system\n"
+            "Transcribe the speech in Indonesian. "
+            "Use this context when transcribing: Danantara<|im_end|>\n"
+            "<|im_start|>user\n<|audio_start|><|audio_pad|><|audio_end|><|im_end|>\n"
+            "<|im_start|>assistant\n",
+        )
+
     def test_old_named_entity_wording_is_gone(self) -> None:
         prompt = _build_chat_prompt(context="anything", language="Chinese")
 

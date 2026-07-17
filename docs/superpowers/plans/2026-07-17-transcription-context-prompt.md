@@ -234,8 +234,8 @@ to:
 Run: `DEVICE=cpu .venv/bin/python -c "import app.api.v1.openai_compatible; print('ok')"`
 Expected: `ok`
 
-Run: `grep -rn "命名实体\|resolving named entities" app/ tests/`
-Expected: no matches. (If `app/` matches somewhere new, a site was missed — stop and check it against the spec's Changes table before proceeding.)
+Run: `grep -rn "命名实体\|resolving named entities" app/`
+Expected: no matches in `app/`. (If `app/` matches somewhere, a site was missed — stop and check it against the spec's Changes table before proceeding. Note: `tests/test_chat_prompt.py` intentionally contains `resolving named entities` twice — in its docstring and in the `assertNotIn` regression guard mandated by Task 1 — so do NOT grep `tests/` expecting zero matches.)
 
 - [ ] **Step 5: Run the full suite (no regressions)**
 
@@ -315,9 +315,14 @@ keywords, never numbers or dates.
 USAGE
 -----
   # against a running service (wording = whatever build is deployed).
-  # --wording-tag is REQUIRED and records WHICH build produced the file
-  # ('old' or 'new'); compare refuses same-tag or tag-less files (exit 2)
-  # so two runs of the same build can never yield a guaranteed PASS:
+  # --wording-tag is REQUIRED and records the OPERATOR'S ASSERTION of which
+  # build produced the file ('old' or 'new'). compare exits 2 unless the
+  # baseline file is tagged 'old' and the candidate file is tagged 'new',
+  # which catches mislabeled, misordered, or tag-less FILES — it is NOT
+  # build identity and cannot detect two honest runs of the same build
+  # (e.g. a forgotten redeploy). The only thing that ties a result file to
+  # a build is the in-container wording assertion (plan Task 4 Steps 2-3),
+  # which the operator must not skip:
   python scripts/h100/bench_context_prompt.py run --wording-tag old \
       --audio-dir /path/to/clips --out /tmp/wording_old.json
 
@@ -348,9 +353,12 @@ Each clip is transcribed under four conditions per iteration:
             shared by all clips — the spec's motivating use case. Measured
             and recorded; NON-blocking (the spec claims no improvement).
 
-Exit codes: run — 0 ok, 2 setup error. compare — 0 PASS, 1 FAIL (blocked),
-2 harness error (e.g. mismatched clip sets between the two runs, or both
-files carrying the same/missing wording_tag).
+Exit codes: run — 0 ok, 2 setup error; an UNCAUGHT mid-flight error (e.g. an
+HTTP failure partway through a run) exits 1, which for `run` means only "the
+run is incomplete, rerun it" — it is NOT a verdict of any kind. compare —
+0 PASS, 1 FAIL (blocked), 2 harness error (e.g. mismatched clip sets between
+the two runs, files with missing/same wording_tag, or the baseline/candidate
+arguments passed in the wrong order).
 """
 
 import argparse
@@ -377,7 +385,10 @@ HIT_RATE_TOLERANCE = 0.10
 # so a multi-clip candidate at exactly the documented band edge (80% -> 70%)
 # would block against the stated ">= baseline - 0.10" rule. A single-clip run
 # has no accumulation error, which masks the bug in small-fixture tests —
-# real runs (>= 10 clips) hit it. Round both sides before comparing.
+# real runs (>= 10 clips) hit it. Round both sides before comparing. The
+# leak comparison needs the same treatment: two per-clip leak multisets with
+# the same true mean can avg() to unequal floats, and a raw `>` would turn
+# that artifact into a false blocking FAIL.
 _BAND_EPSILON_PLACES = 9
 
 
@@ -554,8 +565,12 @@ def _load_summary(label: str, path_str: str) -> dict:
             f"MALFORMED {label}: not a `run` summary (missing 'timestamp'). "
             "Both files must come from this script's `run`; no verdict."
         )
-    # Build identity: without this, comparing two runs of the SAME build
-    # yields a guaranteed PASS — the merge-permitting verdict, on no evidence.
+    # Operator assertion, NOT build identity: the tag records which build the
+    # operator SAYS produced the file, letting compare refuse mislabeled,
+    # misordered, or tag-less FILES. Nothing here ties the file to the
+    # deployed artifact — only the in-container wording assertion (plan
+    # Task 4 Steps 2-3) does that, and skipping it can still compare a
+    # build against itself.
     if doc.get("wording_tag") not in ("old", "new"):
         raise _CompareInputError(
             f"MALFORMED {label} file {path_str}: 'wording_tag' is "
@@ -633,13 +648,23 @@ def cmd_compare(args: argparse.Namespace) -> int:
     except _CompareInputError as exc:
         print(exc, file=sys.stderr)
         return 2
-    if old["wording_tag"] == new["wording_tag"]:
+    # Orientation guard: both blocking rules are DIRECTIONAL (new_leak >
+    # old_leak; the hit band), so swapping compare's two arguments inverts
+    # the verdict — a catastrophic regression compared backwards prints
+    # PASS. Enforce that the file passed as baseline is tagged 'old' and
+    # the file passed as candidate is tagged 'new'; anything else (same
+    # tags included) is a harness error, never a verdict. Deliberately no
+    # silent auto-swap: reordering behind the operator's back would hide
+    # their mistake — refuse and make them re-run the command correctly.
+    if old["wording_tag"] != "old" or new["wording_tag"] != "new":
         print(
-            f"SAME WORDING TAG: baseline {args.baseline} and candidate "
-            f"{args.candidate} both carry wording_tag="
-            f"{old['wording_tag']!r} — comparing a build against itself is a "
-            "guaranteed PASS on no evidence. Re-run one side against the "
-            "other build; no verdict.",
+            f"WORDING TAG ORIENTATION: baseline {args.baseline} carries "
+            f"wording_tag={old['wording_tag']!r} and candidate "
+            f"{args.candidate} carries wording_tag={new['wording_tag']!r}; "
+            "compare requires baseline tagged 'old' and candidate tagged "
+            "'new'. The blocking rules are directional, so a swapped or "
+            "same-tag comparison would invert or void the verdict. Re-run "
+            "as `compare <old-tagged file> <new-tagged file>`; no verdict.",
             file=sys.stderr,
         )
         return 2
@@ -676,7 +701,14 @@ def cmd_compare(args: argparse.Namespace) -> int:
         old_leak, new_leak = avg(old["leak_rate"][condition]), avg(new["leak_rate"][condition])
         marker = ""
         if condition == "hotwords":
-            if new_leak > old_leak:
+            # Same float hygiene as the hit band below: avg() is a plain
+            # float sum, so two per-clip multisets with the same TRUE mean
+            # can average to unequal floats (e.g. [0.3, 0.0, 0.0] vs
+            # [0.1, 0.1, 0.1]) and a raw `>` would emit a false FAIL — an
+            # exit 1 a human records as "regression confirmed". Rounding
+            # both sides removes the artifact without loosening the rule's
+            # zero tolerance: any genuine increase still blocks.
+            if round(new_leak, _BAND_EPSILON_PLACES) > round(old_leak, _BAND_EPSILON_PLACES):
                 verdict_pass = False
                 marker += "  <-- BLOCKING: leak rate increased (context echoed into transcript)"
             if round(new_hit, _BAND_EPSILON_PLACES) < round(
@@ -729,8 +761,10 @@ def main() -> int:
         "--wording-tag",
         required=True,
         choices=("old", "new"),
-        help="which build this run measures; recorded in the output JSON so "
-        "`compare` can refuse two runs of the same build (exit 2)",
+        help="operator's assertion of which build this run measures; "
+        "recorded in the output JSON so `compare` can refuse mislabeled or "
+        "misordered files (exit 2). Not build identity — verify the deployed "
+        "wording in-container (plan Task 4 Steps 2-3)",
     )
     run_p.add_argument("--iterations", type=int, default=10)
     run_p.add_argument("--timeout", type=float, default=120.0)
@@ -765,7 +799,7 @@ Run: `.venv/bin/python scripts/h100/bench_context_prompt.py --help`
 Expected: usage text with `run` and `compare` subcommands, exit 0.
 
 Run: `.venv/bin/python scripts/h100/bench_context_prompt.py run --wording-tag old --audio-dir /tmp --out /tmp/x.json`
-Expected: exits 2 with `need >= 3 keyword-named clips, found 0` (no audio in `/tmp` — proves case loading and argument plumbing work without touching the network). Omitting `--wording-tag`, or passing anything other than `old`/`new`, must be rejected by argparse (exit 2) — the tag records which build produced the file so `compare` can refuse same-build comparisons.
+Expected: exits 2 with `need >= 3 keyword-named clips, found 0` (no audio in `/tmp` — proves case loading and argument plumbing work without touching the network). Omitting `--wording-tag`, or passing anything other than `old`/`new`, must be rejected by argparse (exit 2) — the tag records the operator's assertion of which build produced the file so `compare` can refuse mislabeled or misordered files (baseline must be tagged `old`, candidate `new`). It is not build identity — only the in-container wording assertion (Task 4 Steps 2–3) ties a result to a build.
 
 - [ ] **Step 3: Verify `compare` and `classify` end-to-end with synthetic fixtures — including the leak rule**
 
@@ -915,7 +949,7 @@ python scripts/h100/bench_context_prompt.py compare /tmp/wording_old.json /tmp/w
 
 - Exit 0 (PASS): record both JSON files' summaries and the compare output in the PR / `bd` issue, explicitly stating the MDE caveat above. Merge may proceed.
 - Exit 1 (FAIL): **do not merge.** Follow the spec's rollback: revert item 1 to the original string (item 2's needle reverts with it — one commit, since they are atomic). Task 2's doc fixes may still land: they describe behavior that is already true today under either wording. File a `bd` issue with the numbers so the next wording attempt starts from data.
-- Exit 2 (harness error, e.g. mismatched clip sets, or both files carrying the same/missing `wording_tag` — two runs of the same build compared to each other would be a guaranteed PASS on no evidence): fix the setup and rerun both sides; there is no verdict.
+- Exit 2 (harness error, e.g. mismatched clip sets, files carrying a missing/same `wording_tag`, or the baseline/candidate arguments passed in the wrong order — the blocking rules are directional, so a swapped or mislabeled comparison would invert or void the verdict): fix the setup and rerun the compare (or the affected run); there is no verdict. Note the tag check catches mislabeled/misordered FILES only; it cannot detect a forgotten redeploy — that is what the in-container wording assertions in Steps 2–3 are for.
 - Marginal (hit delta inside the band but consistently negative across most clips): add more **distinct clips** — not iterations — and rerun both sides before deciding.
 
 Also record the `topic` condition (keyword-free background — the spec's motivating "general background context" use case) and the `sentence` condition in the write-up: hit and leak rates, old vs new. Neither is a merge criterion — the spec makes no improvement claim and this plan does not smuggle one in — but the topic numbers are the first real data on the use case that motivated the change. A leak appearing under `sentence` on the new wording is worth a `bd` issue even though only `hotwords` blocks. But know what each condition can and cannot show:
