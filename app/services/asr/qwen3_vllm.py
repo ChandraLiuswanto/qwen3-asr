@@ -148,22 +148,6 @@ def _sanitize_context(context: str) -> str:
     return text.strip()[:_MAX_CONTEXT_CHARS]
 
 
-def _build_chat_prompt(context: str = "", language: Optional[str] = None) -> str:
-    instructions: list[str] = []
-    if language:
-        instructions.append(f"Transcribe the speech in {language}.")
-    else:
-        instructions.append("Transcribe the speech accurately.")
-    if context.strip():
-        instructions.append(f"Use this context when transcribing: {context.strip()}")
-    system_text = " ".join(instructions).strip()
-    return (
-        f"<|im_start|>system\n{system_text}<|im_end|>\n"
-        "<|im_start|>user\n<|audio_start|><|audio_pad|><|audio_end|><|im_end|>\n"
-        "<|im_start|>assistant\n"
-    )
-
-
 def _build_alignment_prompt(tokens: list[str]) -> str:
     body = "<timestamp><timestamp>".join(tokens) + "<timestamp><timestamp>"
     return f"<|audio_start|><|audio_pad|><|audio_end|>{body}"
@@ -306,6 +290,39 @@ class Qwen3VLLMBackend:
         self._aligner_lock = threading.Lock()
         self._aligner_init_lock = threading.Lock()
 
+    def _build_chat_prompt(self, context: str = "", language: Optional[str] = None) -> str:
+        """Render the prompt exactly as the model was trained.
+
+        - Context is the RAW system message (sanitized) — the template's
+          system slot IS the context slot; no wrapper sentences.
+        - Language forcing is the assistant-turn prefill
+          `language {Lang}<asr_text>` (upstream _build_text_prompt), which
+          starts the model's answer so there is nothing left to decide.
+          `language` must already be canonical (_normalize_language_name).
+        - The template is the model-shipped chat_template.json, passed
+          explicitly because the tokenizer never loads that file itself.
+
+        Runs OUTSIDE _llm_lock by design: tokenize=False is pure Jinja and
+        never enters the Rust fast-tokenizer, so the "Already borrowed"
+        hazard the lock guards against does not apply here.
+        """
+        msgs = [
+            {"role": "system", "content": _sanitize_context(context)},
+            # Dummy "" payload is upstream's own pattern: the template only
+            # checks the audio item's PRESENCE. Real audio still travels via
+            # multi_modal_data.
+            {"role": "user", "content": [{"type": "audio", "audio": ""}]},
+        ]
+        base = self._tokenizer.apply_chat_template(
+            msgs,
+            chat_template=self._chat_template,
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+        if language:
+            base += f"language {language}<asr_text>"
+        return base
+
     def _get_forced_aligner_gpu_memory_utilization(self) -> float:
         configured = _resolve_forced_aligner_gpu_memory_utilization(self._gpu_memory_utilization)
         logger.info(
@@ -359,7 +376,7 @@ class Qwen3VLLMBackend:
         for audio, context, language in audio_items:
             prompts.append(
                 {
-                    "prompt": _build_chat_prompt(context=context, language=_normalize_language_name(language)),
+                    "prompt": self._build_chat_prompt(context=context, language=_normalize_language_name(language)),
                     "multi_modal_data": {"audio": [audio]},
                 }
             )
@@ -535,7 +552,7 @@ class Qwen3VLLMBackend:
     ) -> VLLMRealtimeState:
         normalized_language = _normalize_language_name(language) or ""
         return VLLMRealtimeState(
-            prompt_raw=_build_chat_prompt(context=context, language=normalized_language or None),
+            prompt_raw=self._build_chat_prompt(context=context, language=normalized_language or None),
             language=normalized_language,
             chunk_size_sec=chunk_size_sec,
             unfixed_chunk_num=unfixed_chunk_num,

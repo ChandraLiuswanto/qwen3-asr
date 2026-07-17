@@ -59,11 +59,12 @@ import itertools
 import threading
 import time
 import unittest
-
+from pathlib import Path
 
 import numpy as np
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
-from app.services.asr.qwen3_vllm import Qwen3VLLMBackend
+from app.services.asr.qwen3_vllm import Qwen3VLLMBackend, _load_chat_template
 
 # Rendezvous timeout. When the lock serializes callers, the second caller never
 # shows up, so the first must time out and proceed SOLO rather than hang.
@@ -202,12 +203,12 @@ class _FakeLLM:
 
     @staticmethod
     def _marker(prompt: dict) -> str:
-        # The caller's context string is embedded in the chat prompt by
-        # _build_chat_prompt, so the generated text traces back to its
-        # submitter. That traceability is what lets us prove WRONG TEXT landed
-        # on the WRONG request, rather than just "counts differ".
+        # The caller's context string IS the system-turn content under the
+        # native prompt format, so slice the system turn directly. The
+        # traceability guarantee (WRONG TEXT on the WRONG request is provable)
+        # is unchanged.
         text = prompt["prompt"]
-        needle = "when transcribing: "
+        needle = "<|im_start|>system\n"
         start = text.index(needle) + len(needle)
         return text[start:text.index("<|im_end|>", start)].strip()
 
@@ -266,6 +267,8 @@ def _backend(locked: bool) -> Qwen3VLLMBackend:
     backend._llm = _FakeLLM(engine, turnstile, rendezvous)
     backend._sampling_params = object()
     backend._sampling_params_cls = _FakeSamplingParamsCls
+    backend._tokenizer = PreTrainedTokenizerBase()
+    backend._chat_template = _load_chat_template(Path(__file__).parent / "fixtures" / "qwen3_asr")
     backend._max_inference_batch_size = 4
     backend._llm_lock = threading.Lock() if locked else _NullLock()
     backend._aligner_lock = threading.Lock()
