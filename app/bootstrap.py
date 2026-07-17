@@ -6,8 +6,22 @@ from __future__ import annotations
 import sys
 
 
+def validate_model_path_overrides() -> None:
+    """Validate MODEL_PATH_* overrides, raising on the first bad one.
+
+    Deliberately outside ensure_models_downloaded's try/except: that block turns
+    every exception into a warning print, which is the opposite of the fail-loud
+    contract these overrides carry.
+    """
+    from app.core.model_paths import get_model_path_overrides
+
+    get_model_path_overrides()
+
+
 def ensure_models_downloaded(interactive: bool) -> bool:
     """Ensure declared deployment models exist locally, downloading if needed."""
+    validate_model_path_overrides()
+
     try:
         from app.infrastructure import is_huggingface_offline
         from app.utils.download_models import check_all_models, download_models

@@ -1,10 +1,13 @@
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
+from app.bootstrap import validate_model_path_overrides
 from app.core import model_paths
 from app.core.config import settings
 from app.infrastructure.model_utils import (
@@ -569,3 +572,119 @@ class ExportRefusesOverridesTest(unittest.TestCase):
             model_dir = _make_model_dir(temp_dir, "vad")
             with mock.patch.dict(os.environ, {"MODEL_PATH_VAD": model_dir}, clear=True):
                 self._assert_reaches_check_all_models()
+
+
+class BootstrapValidationTest(unittest.TestCase):
+    def setUp(self) -> None:
+        model_paths.reset_override_cache()
+        self.addCleanup(model_paths.reset_override_cache)
+
+    def test_bad_override_raises_rather_than_being_swallowed(self) -> None:
+        with mock.patch.dict(
+            os.environ, {"MODEL_PATH_VAD": "/nonexistent/vad"}, clear=True
+        ):
+            with self.assertRaises(ValueError):
+                validate_model_path_overrides()
+
+    def test_valid_overrides_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = _make_model_dir(temp_dir, "vad")
+            with mock.patch.dict(os.environ, {"MODEL_PATH_VAD": model_dir}, clear=True):
+                validate_model_path_overrides()  # must not raise
+
+    def test_ensure_models_downloaded_does_not_swallow_bad_override(self) -> None:
+        from app.bootstrap import ensure_models_downloaded
+
+        with mock.patch.dict(
+            os.environ, {"MODEL_PATH_VAD": "/nonexistent/vad"}, clear=True
+        ):
+            with self.assertRaises(ValueError):
+                ensure_models_downloaded(interactive=False)
+
+
+class ValidationFiresWithoutBootstrapTest(unittest.TestCase):
+    """Spec test 13: the WORKERS>1 and standalone-CLI paths never call bootstrap."""
+
+    def setUp(self) -> None:
+        model_paths.reset_override_cache()
+        self.addCleanup(model_paths.reset_override_cache)
+
+    def test_integrity_check_rejects_bad_override(self) -> None:
+        # The WORKERS>1 path: start.py skips preflight, main.py's lifespan calls
+        # verify_required_models_integrity, which must still refuse to start.
+        with mock.patch(
+            "app.services.asr.qwenasr_rust.is_qwenasr_rust_available", return_value=True
+        ):
+            with mock.patch.dict(
+                os.environ, {"MODEL_PATH_VAD": "/nonexistent/vad"}, clear=True
+            ):
+                with self.assertRaises(ValueError):
+                    _build_required_model_integrity_specs()
+
+    def test_download_cli_rejects_bad_override(self) -> None:
+        with mock.patch(
+            "app.services.asr.qwenasr_rust.is_qwenasr_rust_available", return_value=True
+        ):
+            with mock.patch.dict(
+                os.environ, {"MODEL_PATH_VAD": "/nonexistent/vad"}, clear=True
+            ):
+                with self.assertRaises(ValueError):
+                    run_download_models(auto_mode=True)
+
+
+class DotenvReachesEveryEntrypointTest(unittest.TestCase):
+    def test_importing_settings_loads_dotenv(self) -> None:
+        # A subprocess with a .env in cwd and nothing in the environment: importing
+        # settings alone must make MODEL_PATH_VAD visible. This is what makes the
+        # standalone CLI and bare uvicorn honor .env at all.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = _make_model_dir(temp_dir, "vad")
+            (Path(temp_dir) / ".env").write_text(
+                f"MODEL_PATH_VAD={model_dir}\n", encoding="utf-8"
+            )
+            env = {
+                k: v for k, v in os.environ.items() if not k.startswith("MODEL_PATH_")
+            }
+            env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import app.core.config, os; print(os.getenv('MODEL_PATH_VAD'))",
+                ],
+                cwd=temp_dir,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+
+        self.assertEqual(result.stdout.strip(), model_dir, result.stderr)
+
+    def test_real_environment_wins_over_dotenv(self) -> None:
+        # Docker sets `environment:` explicitly; load_dotenv must not override it.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            from_dotenv = _make_model_dir(temp_dir, "vad-dotenv")
+            from_env = _make_model_dir(temp_dir, "vad-env")
+            (Path(temp_dir) / ".env").write_text(
+                f"MODEL_PATH_VAD={from_dotenv}\n", encoding="utf-8"
+            )
+            env = {
+                k: v for k, v in os.environ.items() if not k.startswith("MODEL_PATH_")
+            }
+            env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
+            env["MODEL_PATH_VAD"] = from_env
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import app.core.config, os; print(os.getenv('MODEL_PATH_VAD'))",
+                ],
+                cwd=temp_dir,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+
+        self.assertEqual(result.stdout.strip(), from_env, result.stderr)
