@@ -270,6 +270,56 @@ def _enable_batched_sv(
     return pipeline_instance
 
 
+def _enable_stage_timing(pipeline_instance: Any) -> Any:
+    """Optional per-stage profiling instrumentation (off by default).
+
+    When ``DIARIZATION_STAGE_TIMINGS=true``, wraps the instance's
+    ``preprocess`` / ``forward`` / ``postprocess`` with ``time.perf_counter()``
+    timing, logged at INFO with a ``[diarization-profile]`` prefix. The env var
+    is checked ONCE here at patch time — not per call — so production stays
+    quiet with zero per-call overhead when off.
+
+    Patching is per-instance only (``types.MethodType``, same style as
+    ``_enable_batched_sv``); the pipeline class is never mutated, preserving
+    the pool's instance-independence invariant.
+    """
+    if os.getenv("DIARIZATION_STAGE_TIMINGS", "").lower() != "true":
+        return pipeline_instance
+
+    import time
+    import types
+
+    for stage_name in ("preprocess", "forward", "postprocess"):
+        original = getattr(pipeline_instance, stage_name, None)
+        if not callable(original):
+            continue
+
+        def timed_stage(
+            self: Any,
+            *args: Any,
+            _original: Any = original,
+            _stage: str = stage_name,
+            **kwargs: Any,
+        ) -> Any:
+            start = time.perf_counter()
+            try:
+                return _original(*args, **kwargs)
+            finally:
+                logger.info(
+                    "[diarization-profile] stage={} elapsed={:.4f}s",
+                    _stage,
+                    time.perf_counter() - start,
+                )
+
+        setattr(
+            pipeline_instance,
+            stage_name,
+            types.MethodType(timed_stage, pipeline_instance),
+        )
+
+    return pipeline_instance
+
+
 def _build_diarization_pipeline() -> Any:
     """Build ONE independent CAM++ pipeline instance (weights + batched SV).
 
@@ -307,6 +357,7 @@ def _build_diarization_pipeline() -> Any:
             modelscope_device,
             max_batch_size=settings.DIARIZATION_SV_BATCH_SIZE,
         )
+        pipeline_instance = _enable_stage_timing(pipeline_instance)
         logger.info("CAM++ 模型加载成功（已启用 batched SV）")
         return pipeline_instance
     except Exception as e:
