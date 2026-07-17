@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-17
 **Status:** Draft design, pending review
-**Scope:** One prompt string in `_build_chat_prompt`, plus four stale doc/annotation
+**Scope:** One prompt string in `_build_chat_prompt`, plus three stale doc/annotation
 sites on the OpenAI endpoint. No API surface changes.
 
 ## Problem
