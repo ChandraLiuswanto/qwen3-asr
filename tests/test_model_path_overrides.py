@@ -11,11 +11,16 @@ from app.infrastructure.model_utils import (
     find_huggingface_snapshot_dir,
     resolve_model_path,
 )
+from app.services.asr.manager import ModelManager
 from app.services.asr.model_capabilities import (
     get_camplusplus_replacement_paths,
     get_slugged_assets,
 )
-from app.utils.download_models import check_all_models, fix_camplusplus_config
+from app.utils.download_models import (
+    check_all_models,
+    fix_camplusplus_config,
+)
+from app.utils.download_models import download_models as run_download_models
 from app.utils.model_loader import _build_required_model_integrity_specs
 
 
@@ -449,3 +454,118 @@ class CamppRewriteTargetTest(unittest.TestCase):
                     side_effect=OSError("read-only file system"),
                 ):
                     self.assertFalse(fix_camplusplus_config())
+
+
+class DeclaredEntryExistsFlagTest(unittest.TestCase):
+    def setUp(self) -> None:
+        model_paths.reset_override_cache()
+        self.addCleanup(model_paths.reset_override_cache)
+
+    def _entries(self, env: dict, cache_dir: str) -> dict:
+        # Picking a default model needs a runnable Qwen build, which a plain CPU
+        # box without the Rust extension does not have; the constructor would
+        # raise before reaching the flags under test. A fresh instance is used
+        # rather than the process singleton so this test cannot leak into others.
+        with mock.patch(
+            "app.services.asr.qwenasr_rust.is_qwenasr_rust_available",
+            return_value=True,
+        ):
+            manager = ModelManager()
+        # MODELSCOPE_PATH is pinned at an empty temp dir so the flags depend on
+        # the override alone, not on whatever this machine happens to have cached.
+        with mock.patch.object(settings, "MODELSCOPE_PATH", cache_dir):
+            with mock.patch.dict(os.environ, env, clear=True):
+                entries = manager.list_declared_entries()
+        return {item["id"]: item for item in entries}
+
+    def test_override_marks_offline_model_as_present(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = _make_model_dir(temp_dir, "qwen")
+            cache_dir = os.path.join(temp_dir, "cache")
+            os.makedirs(cache_dir)
+            entries = self._entries(
+                {"MODEL_PATH_QWEN3_ASR_1_7B": model_dir}, cache_dir
+            )
+
+        self.assertTrue(entries["qwen3-asr-1.7b"]["offline_model"]["exists"])
+        # The un-overridden sibling still reads False, so the True above is
+        # caused by the override rather than by the flag being hardcoded.
+        self.assertFalse(entries["qwen3-asr-0.6b"]["offline_model"]["exists"])
+
+    def test_override_marks_realtime_model_as_present(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = _make_model_dir(temp_dir, "paraformer")
+            cache_dir = os.path.join(temp_dir, "cache")
+            os.makedirs(cache_dir)
+            entries = self._entries(
+                {"MODEL_PATH_PARAFORMER_LARGE": model_dir}, cache_dir
+            )
+
+        self.assertTrue(entries["paraformer-large"]["realtime_model"]["exists"])
+
+    def test_without_override_cache_presence_still_drives_the_flag(self) -> None:
+        realtime_id = (
+            "iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online"
+        )
+        with tempfile.TemporaryDirectory() as cache_dir:
+            _make_model_dir(cache_dir, realtime_id)
+            entries = self._entries({}, cache_dir)
+
+        self.assertTrue(entries["paraformer-large"]["realtime_model"]["exists"])
+        self.assertFalse(entries["qwen3-asr-1.7b"]["offline_model"]["exists"])
+
+
+class ExportRefusesOverridesTest(unittest.TestCase):
+    def setUp(self) -> None:
+        model_paths.reset_override_cache()
+        self.addCleanup(model_paths.reset_override_cache)
+
+    def test_export_refuses_when_overrides_are_set(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = _make_model_dir(temp_dir, "vad")
+            export_dir = Path(temp_dir) / "export"
+            with mock.patch.dict(os.environ, {"MODEL_PATH_VAD": model_dir}, clear=True):
+                # check_all_models is mocked so this test can never reach a real
+                # snapshot_download or a multi-GB copytree. The guard under test
+                # sits BEFORE this call; if it regresses, the test fails fast and
+                # offline rather than hammering the network.
+                with mock.patch(
+                    "app.utils.download_models.check_all_models", return_value=[]
+                ):
+                    result = run_download_models(
+                        auto_mode=True, export_dir=str(export_dir)
+                    )
+
+        self.assertFalse(result)
+        self.assertFalse(export_dir.exists())
+
+    def _assert_reaches_check_all_models(self, **kwargs) -> None:
+        """Assert download_models gets past the guard and into check_all_models.
+
+        check_all_models is stubbed to raise a sentinel, so execution stops the
+        instant the guard is cleared. Nothing downloads, nothing is copied, and
+        the real CAM++ config on this machine is never rewritten.
+        """
+
+        class _Reached(Exception):
+            pass
+
+        with mock.patch(
+            "app.utils.download_models.check_all_models", side_effect=_Reached
+        ):
+            with self.assertRaises(_Reached):
+                run_download_models(auto_mode=True, **kwargs)
+
+    def test_export_without_overrides_is_not_refused(self) -> None:
+        # The guard is conditional on overrides, not on export_dir alone.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            export_dir = Path(temp_dir) / "export"
+            with mock.patch.dict(os.environ, {}, clear=True):
+                self._assert_reaches_check_all_models(export_dir=str(export_dir))
+
+    def test_overrides_do_not_block_a_plain_download(self) -> None:
+        # No export_dir means no cache-relative copying, so overrides are fine.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = _make_model_dir(temp_dir, "vad")
+            with mock.patch.dict(os.environ, {"MODEL_PATH_VAD": model_dir}, clear=True):
+                self._assert_reaches_check_all_models()

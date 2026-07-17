@@ -17,7 +17,7 @@ from huggingface_hub import snapshot_download as hf_snapshot_download
 from modelscope.hub.snapshot_download import snapshot_download as ms_snapshot_download
 
 from app.core.config import settings
-from app.core.model_paths import is_overridden
+from app.core.model_paths import get_model_path_overrides, is_overridden
 from app.infrastructure import (
     find_huggingface_snapshot_dir,
     get_huggingface_cache_root,
@@ -183,6 +183,15 @@ def download_models(
         是否全部下载成功
     """
     import shutil
+
+    overrides = get_model_path_overrides()
+    if export_dir and overrides:
+        print("❌ --export-dir cannot be combined with MODEL_PATH overrides.")
+        print("   Export copies from the model caches; these models live elsewhere:")
+        for model_id, path in sorted(overrides.items()):
+            print(f"     - {model_id}: {path}")
+        print("   Unset the MODEL_PATH_* variables to export, or copy them by hand.")
+        return False
 
     # Check missing models.
     missing = check_all_models()
