@@ -55,6 +55,24 @@ class EmptyCacheGuardTest(unittest.TestCase):
         torch.cuda.empty_cache()
         self.assertEqual(len(self.calls), 1)
 
+    def test_reinstall_after_reload_adopts_wrapper_tls(self) -> None:
+        # Install over the setUp sentinel.
+        sd._install_empty_cache_guard()
+        wrapper = torch.cuda.empty_cache
+
+        # Simulate a module reload: fresh module globals (new flag + new
+        # threading.local) while torch stays wrapped by the OLD wrapper.
+        sd._empty_cache_guard_installed = False
+        sd._empty_cache_tls = threading.local()
+
+        sd._install_empty_cache_guard()
+        # (a) No nesting: still the same live wrapper.
+        self.assertIs(torch.cuda.empty_cache, wrapper)
+        # (b) Suppression still works through the adopted tls.
+        with sd._suppress_empty_cache():
+            torch.cuda.empty_cache()
+        self.assertEqual(len(self.calls), 0)
+
     def test_flag_is_thread_local(self) -> None:
         sd._install_empty_cache_guard()
         other_thread_calls = []

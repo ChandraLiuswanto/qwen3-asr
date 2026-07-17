@@ -39,12 +39,25 @@ _empty_cache_guard_installed = False
 
 
 def _install_empty_cache_guard() -> None:
-    """Wrap torch.cuda.empty_cache once. Idempotent: never nests wrappers."""
-    global _empty_cache_guard_installed
+    """Wrap torch.cuda.empty_cache once. Idempotent: never nests wrappers.
+
+    Acquires `_diarization_pipeline_lock` (non-reentrant). MUST NOT be called
+    while that lock is already held (e.g. from inside the
+    `get_global_diarization_pipeline` critical section) or it will deadlock.
+    """
+    global _empty_cache_guard_installed, _empty_cache_tls
     with _diarization_pipeline_lock:
         if _empty_cache_guard_installed or getattr(
             torch.cuda.empty_cache, "_diarization_guard", False
         ):
+            # Already wrapped. After a module reload the live wrapper closes
+            # over the OLD module's `_empty_cache_tls`, while this reloaded
+            # module has a fresh one. Adopt the wrapper's tls so our
+            # `_suppress_empty_cache` toggles the same threading.local the
+            # live wrapper reads; otherwise suppression is a silent no-op.
+            adopted_tls = getattr(torch.cuda.empty_cache, "_diarization_tls", None)
+            if adopted_tls is not None:
+                _empty_cache_tls = adopted_tls
             _empty_cache_guard_installed = True
             return
 
@@ -56,6 +69,7 @@ def _install_empty_cache_guard() -> None:
             real_empty_cache()
 
         _guarded_empty_cache._diarization_guard = True  # type: ignore[attr-defined]
+        _guarded_empty_cache._diarization_tls = _empty_cache_tls  # type: ignore[attr-defined]
         torch.cuda.empty_cache = _guarded_empty_cache
         _empty_cache_guard_installed = True
         logger.info("已安装 torch.cuda.empty_cache 线程局部守卫（跳过 diarization 内的调用）")
