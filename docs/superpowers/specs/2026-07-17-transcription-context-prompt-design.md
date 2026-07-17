@@ -46,22 +46,31 @@ The narrowing is the whole problem. The wrapper sentence itself is load-bearing 
 ## The convergence
 
 One prompt string serves three public surfaces. All three feed the same `context`
-argument, under three different names:
+argument, under three different names. Paths below are relative to the repo root;
+note there are two `asr.py` files (`app/api/v1/` and `app/models/`).
 
 | Surface | Caller-facing name | Path to `context` | Documented shape |
 |---|---|---|---|
-| OpenAI `/v1/audio/transcriptions` | `prompt` | `openai_compatible.py:496` → `hotwords=prompt or ""` (`:561`) → `qwen3_engine.py:371` `context=hotwords or ""` | "提示文本…（hotwords）" |
-| Alibaba `/stream/v1/asr` | `vocabulary_id` | `asr.py:237` `hotwords=params.vocabulary_id or ""` → same | Bare word list — `阿里巴巴 腾讯` (`asr.py:172`) |
-| WebSocket `/ws/v1/asr/qwen` | `context` | `qwen3_websocket_asr.py:279,291` → `qwen3_engine.py:541` | Undocumented |
+| OpenAI `/v1/audio/transcriptions` | `prompt` | `app/api/v1/openai_compatible.py:496` → `hotwords=prompt or ""` (`:561`) → `app/services/asr/qwen3_engine.py:371` `context=hotwords or ""` | "提示文本…（hotwords）" |
+| Alibaba `/stream/v1/asr` | `vocabulary_id` | `app/api/v1/asr.py:237` `hotwords=params.vocabulary_id or ""` → same | Bare word list — `阿里巴巴 腾讯` (`app/api/v1/asr.py:172`) |
+| WebSocket `/ws/v1/asr/qwen` | `context` | `app/services/qwen3_websocket_asr.py:216-217` and `:279,291` → `qwen3_engine.py:541` | Undocumented |
 
-Both `_build_chat_prompt` call sites are affected: `qwen3_vllm.py:283` (offline batch)
-and `:459` (realtime/alignment). `qwen3_engine.py:371,426,490` all pass
+There is no fourth surface. `app/services/asr/runtime/router.py:221`
+(`hotwords=request.hotwords`) is an internal hop on the offline chain, not an entry
+point.
+
+The WebSocket surface has **two** `init_streaming_state` sites, not one: `:291` on
+initial start, and `:216-217` on segment re-init after truncation. Both pass `context`;
+both change behavior together.
+
+Both `_build_chat_prompt` call sites are affected: `app/services/asr/qwen3_vllm.py:283`
+(offline batch) and `:459` (realtime/alignment). `qwen3_engine.py:371,426,490` all pass
 `context=hotwords or ""`.
 
 **`vocabulary_id` is the constraint that decides the design.** It is documented in
-`README.md:287`, `docs/README_zh.md:285`, `asr.py:112,172`, and `models/asr.py:45` as a
-bare space-separated hotword list, capped at 512 chars. Any change must keep
-`阿里巴巴 腾讯` working as a hint rather than as content.
+`README.md:287`, `docs/README_zh.md:285`, `app/api/v1/asr.py:112,172`, and
+`app/models/asr.py:45` as a bare space-separated hotword list, capped at 512 chars. Any
+change must keep `阿里巴巴 腾讯` working as a hint rather than as content.
 
 ## Decision
 
@@ -114,18 +123,23 @@ instructions) and hurt those who use it correctly (as a style exemplar). Rejecte
 
 | # | Site | Change |
 |---|---|---|
-| 1 | `qwen3_vllm.py:81` | `when resolving named entities:` → `when transcribing:` |
+| 1 | `app/services/asr/qwen3_vllm.py:81` | `when resolving named entities:` → `when transcribing:` |
 | 2 | `tests/test_vllm_mixing_fidelity.py:210` | `needle = "resolving named entities: "` → `"when transcribing: "` |
-| 3 | `openai_compatible.py:413` | Drop `prompt` from the 暂不支持的参数 list — it works. Line becomes `` `temperature`、`timestamp_granularities` 参数已保留但暂不生效 ``. |
-| 4 | `openai_compatible.py:506` | `_ = (prompt, temperature, timestamp_granularities)` → `_ = (temperature, timestamp_granularities)`; `prompt` is read at `:561`. |
-| 5 | `openai_compatible.py:496` | Form description `"提示文本，作为命名实体上下文注入转写提示（hotwords）"` → `"上下文提示文本，作为背景信息注入转写提示（如主题、领域、专有名词）"`. |
+| 3 | `app/api/v1/openai_compatible.py:413` | Drop `prompt` from the 暂不支持的参数 list — it works. Line becomes `` `temperature`、`timestamp_granularities` 参数已保留但暂不生效 ``. |
+| 4 | `app/api/v1/openai_compatible.py:506` | `_ = (prompt, temperature, timestamp_granularities)` → `_ = (temperature, timestamp_granularities)`; `prompt` is read at `:561`. |
+| 5 | `app/api/v1/openai_compatible.py:496` | Form description `"提示文本，作为命名实体上下文注入转写提示（hotwords）"` → `"上下文提示文本，作为背景信息注入转写提示（如主题、领域、专有名词）"`. |
+
+**Items 1 and 2 are atomic — they must land in the same commit.**
+`test_vllm_mixing_fidelity.py` calls the real `_run_generate` (`:285`), so item 1 without
+item 2 makes `_marker()` raise `ValueError` on `.index()`. Items 3–5 are independent and
+may land separately.
 
 Items 3–5 are a pre-existing documentation bug: the endpoint's own OpenAPI description
 tells users `prompt` is inert while line 561 passes it through. They are independent of
 item 1 but touch the same parameter.
 
 **Deliberately not renamed:** `hotwords` as an internal argument name
-(`offline_transcription_service.py:28`, `engines/base.py:92,105,129,402`,
+(`app/services/asr/offline_transcription_service.py:29`, `engines/base.py:92,105,129,402`,
 `engines/funasr.py:57,71`) and the public `vocabulary_id`. Both are wider blast radius
 than this change earns, and `funasr.py` discards the value anyway (`:65,77`).
 
@@ -138,8 +152,12 @@ Convention: `unittest`, not pytest. `DEVICE=cpu .venv/bin/python -m unittest dis
 request produced which text. It does not assert the wording semantically, so item 2 is a
 mechanical needle swap and the test's guarantee is unchanged.
 
-New `tests/test_chat_prompt.py`, direct unit tests on `_build_chat_prompt` (no vLLM
-import needed — the function is pure):
+New `tests/test_chat_prompt.py`, direct unit tests on `_build_chat_prompt`. Importable
+without a vLLM install — `qwen3_vllm.py` has no module-level `vllm` import, only
+`importlib.util.find_spec` at `:52`. Verified by executing
+`from app.services.asr.qwen3_vllm import _build_chat_prompt` in the repo venv. The
+module does pull in `librosa`/`numpy`/`app.infrastructure` at import time, so the
+function is pure but its module is not free to import.
 
 1. Context + language → both instructions present, language first.
 2. Context, no language → `Transcribe the speech accurately.` + context clause.
