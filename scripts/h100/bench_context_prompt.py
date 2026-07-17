@@ -72,6 +72,7 @@ Exit codes: run — 0 ok, 2 setup error. compare — 0 PASS, 1 FAIL (blocked),
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -305,6 +306,24 @@ def _load_summary(label: str, path_str: str) -> dict:
                     f"MALFORMED {label}: non-numeric {key} for clips {sorted(bad)} "
                     f"in {condition!r}; no verdict."
                 )
+            # json.loads accepts NaN/Infinity, and NaN makes every band
+            # comparison False (i.e. PASS) while Infinity in a baseline
+            # leak_rate masks any candidate leak. `run` computes these as
+            # hit/leak fractions, so anything non-finite or outside [0, 1]
+            # is a shape `run` can never emit — a PASS must never be
+            # computed from such observations; no verdict, exit 2.
+            invalid = [
+                (clip, value) for clip, value in doc[key][condition].items()
+                if not math.isfinite(value) or not 0.0 <= value <= 1.0
+            ]
+            if invalid:
+                clip, value = invalid[0]
+                raise _CompareInputError(
+                    f"MALFORMED {label} file {path_str}: {key} for clip "
+                    f"{clip!r} in {condition!r} is {value!r}, which is not a "
+                    "finite rate in [0.0, 1.0]. A real `run` can never emit "
+                    "this; no verdict."
+                )
         if set(doc["hit_rate"][condition]) != set(doc["leak_rate"][condition]):
             raise _CompareInputError(
                 f"MALFORMED {label}: hit_rate and leak_rate list different "
@@ -342,7 +361,11 @@ def cmd_compare(args: argparse.Namespace) -> int:
                 return 2
 
     def avg(rates: dict) -> float:
-        return sum(rates.values()) / len(rates) if rates else 0.0
+        # No empty-table fallback: _load_summary rejects empty per-clip
+        # tables (exit 2), so `rates` is always non-empty here. The old
+        # `if rates else 0.0` branch was the exact path that once scored
+        # a zero-data file as PASS.
+        return sum(rates.values()) / len(rates)
 
     verdict_pass = True
     for condition in CONDITIONS:
@@ -376,7 +399,24 @@ def cmd_compare(args: argparse.Namespace) -> int:
     return 0 if verdict_pass else 1
 
 
+def _force_safe_output() -> None:
+    """Under a non-UTF-8 stdout (PYTHONIOENCODING=ascii, LANG=C piped to a
+    log), printing a CJK clip name (e.g. earnings_阿里巴巴.wav) raises
+    UnicodeEncodeError BEFORE the VERDICT line and Python exits 1 —
+    impersonating a FAIL verdict. Reconfigure both streams so encoding
+    failures degrade to replacement characters instead of crashing; the
+    verdict line and exit code are then always produced."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                pass
+
+
 def main() -> int:
+    _force_safe_output()
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
     run_p = sub.add_parser("run")
