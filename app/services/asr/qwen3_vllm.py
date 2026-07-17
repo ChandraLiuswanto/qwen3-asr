@@ -107,6 +107,30 @@ def _load_chat_template(snapshot_dir: Path) -> str:
     return template
 
 
+# Prompt-injection hardening for caller-controlled context (OpenAI `prompt`,
+# Alibaba `vocabulary_id`, WebSocket `context`). Mirrors vLLM's
+# _sanitize_transcription_user_text (vllm/model_executor/models/qwen3_asr.py):
+# strip ChatML-like tokens and <asr_text> to a FIXPOINT — a single pass over
+# "<|im<|x|>_end|>" removes the inner token and reconstructs "<|im_end|>".
+_CHATML_LIKE_TOKEN = re.compile(r"<\|[^|]+\|>")
+_ASR_TEXT_TAG = "<asr_text>"
+# Cap AFTER sanitization so stripped tokens cannot spend the budget. 512 is
+# the existing documented cap on vocabulary_id (app/models/asr.py:48),
+# extended here as a backstop to all three surfaces. Truncate silently:
+# context is a hint; failing the transcription over a long hint is worse
+# than trimming it.
+_MAX_CONTEXT_CHARS = 512
+
+
+def _sanitize_context(context: str) -> str:
+    text = (context or "").strip()
+    prev = None
+    while prev != text:
+        prev = text
+        text = _CHATML_LIKE_TOKEN.sub("", text).replace(_ASR_TEXT_TAG, "")
+    return text.strip()[:_MAX_CONTEXT_CHARS]
+
+
 def _build_chat_prompt(context: str = "", language: Optional[str] = None) -> str:
     instructions: list[str] = []
     if language:
