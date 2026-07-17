@@ -72,6 +72,12 @@ class Settings:
     # 批处理推理配置（GPU 真并行）
     ASR_BATCH_SIZE: int = 4  # ASR 批处理大小（同时推理的片段数），建议 2-8
     DIARIZATION_SV_BATCH_SIZE: int = 32  # 说话人分离 SV embedding 批处理大小，显存越大可调越高
+    # 后端二次分块上限：backend 会把 base.py 交来的 batch 再按此值切开
+    # (qwen3_vllm.py `_run_align`)，所以有效批大小 =
+    # min(ASR_BATCH_SIZE, 此值, 该请求的片段数)。
+    # None = 沿用 models.json extra_kwargs 的值（qwen3 两个模型均为 16）。
+    # 设置本变量才会覆盖 models.json，未设置时行为完全不变。
+    ASR_MAX_INFERENCE_BATCH_SIZE: Optional[int] = None
 
     # 音频分段配置
     MAX_SEGMENT_SEC: float = 60.0  # Max offline ASR segment duration in seconds.
@@ -148,6 +154,13 @@ class Settings:
         self.VLLM_WS_DECODE_CONCURRENCY = self._positive_int_from_env(
             "VLLM_WS_DECODE_CONCURRENCY", self.VLLM_WS_DECODE_CONCURRENCY
         )
+
+        # Only override models.json when the operator actually sets it; an
+        # unset value must leave the existing per-model config alone.
+        if (os.getenv("ASR_MAX_INFERENCE_BATCH_SIZE") or "").strip():
+            self.ASR_MAX_INFERENCE_BATCH_SIZE = self._positive_int_from_env(
+                "ASR_MAX_INFERENCE_BATCH_SIZE", 16
+            )
 
     @staticmethod
     def _positive_int_from_env(name: str, default: int) -> int:

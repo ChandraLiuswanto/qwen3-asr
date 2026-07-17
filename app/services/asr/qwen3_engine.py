@@ -624,6 +624,10 @@ def _register_qwen3_engine(register_func, _declared_entry_cls):
     def _create(config):
         extra = {k: v for k, v in config.extra_kwargs.items() if v is not None}
         model_id = config.models.get("offline")
+        # Env wins over models.json: this is an ops knob for tuning a live
+        # deployment, and editing a checked-in JSON to change it is worse.
+        if settings.ASR_MAX_INFERENCE_BATCH_SIZE is not None:
+            extra["max_inference_batch_size"] = settings.ASR_MAX_INFERENCE_BATCH_SIZE
         return Qwen3ASREngine(model_path=model_id, device=settings.DEVICE, **extra)
 
     register_func("qwen3", _create)
