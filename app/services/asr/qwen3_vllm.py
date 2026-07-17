@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import json
 import logging
 import os
 import re
 import threading
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Optional
 
 import librosa
@@ -69,6 +71,40 @@ def _normalize_language_name(language: Optional[str]) -> Optional[str]:
 def _load_audio(audio_path: str) -> np.ndarray:
     audio, _sample_rate = librosa.load(audio_path, sr=_DEFAULT_SAMPLE_RATE, mono=True)
     return audio.astype(np.float32)
+
+
+def _load_chat_template(snapshot_dir: Path) -> str:
+    """Read the model-shipped chat template.
+
+    chat_template.json is a processor-level file: transformers tokenizers load
+    only chat_template.jinja / tokenizer_config.json's chat_template key, and
+    this model ships neither — tokenizer.chat_template is None. There is also
+    no AutoProcessor for qwen3_asr in transformers 4.57. So the template must
+    be read here and passed explicitly to every apply_chat_template call.
+
+    Fail loudly when absent: silently falling back to a hand-written template
+    is the exact bug this loader exists to remove.
+    """
+    template_path = snapshot_dir / "chat_template.json"
+    if not template_path.is_file():
+        raise RuntimeError(
+            f"chat_template.json not found in model snapshot {snapshot_dir}; "
+            "Qwen3-ASR prompt construction requires the model-shipped template "
+            "and will not invent one"
+        )
+    try:
+        payload = json.loads(template_path.read_text(encoding="utf-8"))
+        template = payload["chat_template"]
+    except (ValueError, KeyError, TypeError) as exc:
+        raise RuntimeError(
+            f"chat_template.json in {snapshot_dir} is malformed: {exc}"
+        ) from exc
+    if not isinstance(template, str) or not template.strip():
+        raise RuntimeError(
+            f"chat_template.json in {snapshot_dir} carries an empty or "
+            "non-string 'chat_template' value"
+        )
+    return template
 
 
 def _build_chat_prompt(context: str = "", language: Optional[str] = None) -> str:
@@ -191,6 +227,8 @@ class Qwen3VLLMBackend:
             trust_remote_code=True,
             local_files_only=True,
         )
+
+        self._chat_template = _load_chat_template(Path(local_model_path))
 
         llm_kwargs: dict[str, Any] = {
             "model": local_model_path,
