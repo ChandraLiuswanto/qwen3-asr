@@ -8,6 +8,15 @@ import os
 from typing import Optional
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+# Loaded here rather than in start.py alone: `python -m app.utils.download_models`
+# and a bare `uvicorn app.main:app` never run start.py, so .env was invisible to
+# them. Everything imports settings, so this reaches every entrypoint. Real
+# environment variables already set take precedence (load_dotenv does not
+# override), so Docker's explicit `environment:` entries still win.
+load_dotenv()
+
 
 class Settings:
     """统一应用配置类"""

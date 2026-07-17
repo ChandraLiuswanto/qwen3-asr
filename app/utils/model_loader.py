@@ -250,6 +250,7 @@ def _should_check_qwen_forced_aligner(
 def _build_required_model_integrity_specs() -> list[ModelIntegritySpec]:
     from ..core.config import settings
     from ..core.device import detect_device
+    from ..core.model_paths import is_overridden
     from ..services.asr.manager import get_model_manager
     from ..services.asr.model_capabilities import (
         get_enabled_qwen_huggingface_assets,
@@ -269,6 +270,12 @@ def _build_required_model_integrity_specs() -> list[ModelIntegritySpec]:
     for asset in get_runtime_required_modelscope_assets(
         include_realtime_punc=True,
     ):
+        if is_overridden(asset.model_id):
+            logger.info(
+                "Skipping integrity check for %s: MODEL_PATH override in use",
+                asset.model_id,
+            )
+            continue
         specs.append(
             _build_modelscope_spec(
                 asset.model_id,
@@ -285,6 +292,12 @@ def _build_required_model_integrity_specs() -> list[ModelIntegritySpec]:
             using_cpu_qwen_rust=using_cpu_qwen_rust,
         ),
     ):
+        if is_overridden(asset.model_id):
+            logger.info(
+                "Skipping integrity check for %s: MODEL_PATH override in use",
+                asset.model_id,
+            )
+            continue
         specs.append(
             _build_huggingface_spec(
                 asset.model_id,
@@ -393,8 +406,12 @@ def preload_models() -> dict[str, Any]:
     try:
         from .download_models import fix_camplusplus_config
         fix_camplusplus_config()
+    except RuntimeError:
+        # Offline repair failure is fatal: diarization would silently reach for
+        # modelscope.cn at request time. See fix_camplusplus_config.
+        raise
     except Exception:
-        pass  # Config repair failures should not block startup.
+        pass  # Other config repair failures should not block startup.
 
     result: dict[str, Any] = {
         "asr_models": {},  # ASR model loading status.

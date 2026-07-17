@@ -17,6 +17,7 @@ from huggingface_hub import snapshot_download as hf_snapshot_download
 from modelscope.hub.snapshot_download import snapshot_download as ms_snapshot_download
 
 from app.core.config import settings
+from app.core.model_paths import get_model_path_overrides, is_overridden
 from app.infrastructure import (
     find_huggingface_snapshot_dir,
     get_huggingface_cache_root,
@@ -83,12 +84,16 @@ def check_all_models() -> list[tuple[str, str, str, Optional[str]]]:
 
     # Check ModelScope models.
     for asset in ms_assets:
+        if is_overridden(asset.model_id):
+            continue
         exists, _ = check_model_exists(asset.model_id, source="modelscope")
         if not exists:
             missing.append((asset.model_id, asset.description, "modelscope", asset.revision))
 
     # Check Hugging Face models. HF assets currently do not use pinned revisions.
     for asset in hf_assets:
+        if is_overridden(asset.model_id):
+            continue
         exists, _ = check_model_exists(asset.model_id, source="huggingface")
         if not exists:
             missing.append((asset.model_id, asset.description, "huggingface", None))
@@ -105,9 +110,12 @@ def fix_camplusplus_config() -> bool:
     Returns:
         是否修复成功
     """
+    from app.infrastructure.model_utils import resolve_model_path
+
+    diarization_id = "iic/speech_campplus_speaker-diarization_common"
+
     try:
-        cache_dir = Path(settings.MODELSCOPE_PATH)
-        config_file = cache_dir / "iic/speech_campplus_speaker-diarization_common/configuration.json"
+        config_file = Path(resolve_model_path(diarization_id)) / "configuration.json"
 
         if not config_file.exists():
             return False
@@ -117,7 +125,7 @@ def fix_camplusplus_config() -> bool:
             config = json.load(f)
 
         # Model id to local path replacements.
-        replacements = get_camplusplus_replacement_paths(str(cache_dir))
+        replacements = get_camplusplus_replacement_paths()
 
         # Check whether any replacement is needed.
         modified = False
@@ -132,17 +140,33 @@ def fix_camplusplus_config() -> bool:
                             config["model"][key] = new_value
                             modified = True
 
-        # Write the config file back.
-        if modified:
-            with open(config_file, 'w', encoding='utf-8') as f:
-                json.dump(config, f, indent=4, ensure_ascii=False)
-            return True
-
-        return False
+        if not modified:
+            return False
 
     except Exception as e:
         print(f"⚠️  修复 CAM++ 配置文件失败: {e}")
         return False
+
+    # The write sits outside the catch-all above on purpose: an offline rewrite
+    # failure must be able to abort startup, and that except Exception would
+    # turn the RuntimeError back into a warning.
+    try:
+        with open(config_file, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=4, ensure_ascii=False)
+    except OSError as e:
+        # An override may point at a read-only mount. Offline runs need this
+        # rewrite or diarization reaches for modelscope.cn; online runs can
+        # still fetch, so they only warn.
+        message = (
+            f"Cannot rewrite {config_file} for offline use: {e}. "
+            f"Make the directory writable, or pre-patch the config."
+        )
+        if is_huggingface_offline():
+            raise RuntimeError(message) from e
+        print(f"⚠️  {message}")
+        return False
+
+    return True
 
 
 def download_models(
@@ -159,6 +183,18 @@ def download_models(
         是否全部下载成功
     """
     import shutil
+
+    # Called unconditionally on purpose -- do NOT guard this behind `if export_dir`.
+    # `python -m app.utils.download_models` never runs bootstrap, so this is the
+    # only place a bad MODEL_PATH_* is validated on the plain-download path.
+    overrides = get_model_path_overrides()
+    if export_dir and overrides:
+        print("❌ --export-dir cannot be combined with MODEL_PATH overrides.")
+        print("   Export copies from the model caches; these models live elsewhere:")
+        for model_id, path in sorted(overrides.items()):
+            print(f"     - {model_id}: {path}")
+        print("   Unset the MODEL_PATH_* variables to export, or copy them by hand.")
+        return False
 
     # Check missing models.
     missing = check_all_models()

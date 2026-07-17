@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Callable
 from ...core.config import settings
 from ...core.exceptions import DefaultServerErrorException, InvalidParameterException
+from ...core.model_paths import get_override
 from .engines import BaseASREngine
 from .model_plan import get_default_model_id
 
@@ -30,6 +31,19 @@ def _supports_qwen_realtime_on_device(configured_device: str) -> bool:
     if device == "cpu":
         return is_qwenasr_rust_available()
     return False
+
+
+def _declared_model_exists(model_id: str) -> bool:
+    """Report whether a declared model is present locally.
+
+    Pre-existing quirk preserved: HF-hosted ids (Qwen/...) are checked against the
+    ModelScope cache, so they read False unless overridden. Fixing that is out of
+    scope here; this only ensures an explicit override reads True.
+    """
+    override = get_override(model_id)
+    if override is not None:
+        return True
+    return (Path(settings.MODELSCOPE_PATH) / model_id).exists()
 
 
 def register_engine(engine_type: str, factory: Callable[[Any], BaseASREngine]):
@@ -122,16 +136,10 @@ class ModelManager:
             realtime_path_exists = False
 
             if config.offline_model_path:
-                offline_model_path = (
-                    Path(settings.MODELSCOPE_PATH) / config.offline_model_path
-                )
-                offline_path_exists = offline_model_path.exists()
+                offline_path_exists = _declared_model_exists(config.offline_model_path)
 
             if config.realtime_model_path:
-                realtime_model_path = (
-                    Path(settings.MODELSCOPE_PATH) / config.realtime_model_path
-                )
-                realtime_path_exists = realtime_model_path.exists()
+                realtime_path_exists = _declared_model_exists(config.realtime_model_path)
 
             supports_realtime = config.supports_realtime
             if config.engine == "qwen3":

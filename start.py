@@ -7,9 +7,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from dotenv import load_dotenv
-
-load_dotenv()
+# .env is loaded by app.core.config on import, which every entrypoint reaches.
+from app.core import config as _config  # noqa: F401
 
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")

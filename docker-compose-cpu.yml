@@ -12,6 +12,9 @@ services:
       - ./data:/app/data
       - ./models/modelscope:/root/.cache/modelscope
       - ./models/huggingface:/root/.cache/huggingface
+    env_file:
+      - path: .env
+        required: false
     environment:
       API_KEY: ${API_KEY:-}
       HF_HUB_OFFLINE: ${HF_HUB_OFFLINE:-0}

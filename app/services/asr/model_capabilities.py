@@ -19,6 +19,7 @@ class ModelAsset:
     source: ModelSource
     model_id: str
     description: str
+    slug: Optional[str] = None
     revision: Optional[str] = None
     required_patterns: tuple[str, ...] = ()
     alternative_required_patterns: tuple[tuple[str, ...], ...] = ()
@@ -30,6 +31,7 @@ _VAD_ASSETS = (
         source="modelscope",
         model_id=settings.VAD_MODEL,
         description="VAD",
+        slug="VAD",
         revision="v2.0.2",
         required_patterns=("configuration.json", "config.yaml", "model.pb"),
         min_total_size_bytes=1_000_000,
@@ -41,6 +43,7 @@ _DIARIZATION_ASSETS = (
         source="modelscope",
         model_id="iic/speech_campplus_speaker-diarization_common",
         description="CAM++ Diarization",
+        slug="CAMPP_DIARIZATION",
         required_patterns=(
             "configuration.json",
             "config.yaml",
@@ -55,6 +58,7 @@ _DIARIZATION_ASSETS = (
         source="modelscope",
         model_id="damo/speech_campplus_sv_zh-cn_16k-common",
         description="CAM++ Speaker Verification",
+        slug="CAMPP_SV",
         required_patterns=("configuration.json", "config.yaml", "campplus_cn_common.bin"),
         min_total_size_bytes=10_000_000,
     ),
@@ -62,6 +66,7 @@ _DIARIZATION_ASSETS = (
         source="modelscope",
         model_id="damo/speech_campplus-transformer_scl_zh-cn_16k-common",
         description="CAM++ Transformer",
+        slug="CAMPP_TRANSFORMER",
         required_patterns=("configuration.json", "campplus_cn_encoder.pt", "transformer_backend.pt"),
         min_total_size_bytes=10_000_000,
     ),
@@ -85,6 +90,7 @@ _REALTIME_PARAFORMER_ASSETS = (
         source="modelscope",
         model_id=settings.PUNC_MODEL,
         description="Punctuation Offline",
+        slug="PUNC",
         required_patterns=("configuration.json", "config.yaml", "model.pt", "tokens.json"),
         min_total_size_bytes=50_000_000,
     ),
@@ -94,6 +100,7 @@ _REALTIME_PUNC_ASSET = ModelAsset(
     source="modelscope",
     model_id=settings.PUNC_REALTIME_MODEL,
     description="Punctuation Realtime",
+    slug="PUNC_REALTIME",
     required_patterns=("configuration.json", "config.yaml", "model.pt", "tokens.json"),
     min_total_size_bytes=50_000_000,
 )
@@ -164,10 +171,33 @@ def get_enabled_qwen_huggingface_assets(
     return assets
 
 
-def get_camplusplus_replacement_paths(cache_dir: str) -> dict[str, str]:
-    """Return the CAM++ offline replacement map for local cache paths."""
+def get_camplusplus_replacement_paths() -> dict[str, str]:
+    """Return the CAM++ offline replacement map, honoring MODEL_PATH overrides."""
+    from app.infrastructure.model_utils import resolve_model_path
+
     return {
-        "damo/speech_campplus_sv_zh-cn_16k-common": f"{cache_dir}/damo/speech_campplus_sv_zh-cn_16k-common",
-        "damo/speech_campplus-transformer_scl_zh-cn_16k-common": f"{cache_dir}/damo/speech_campplus-transformer_scl_zh-cn_16k-common",
-        "damo/speech_fsmn_vad_zh-cn-16k-common-pytorch": f"{cache_dir}/damo/speech_fsmn_vad_zh-cn-16k-common-pytorch",
+        model_id: resolve_model_path(model_id)
+        for model_id in (
+            "damo/speech_campplus_sv_zh-cn_16k-common",
+            "damo/speech_campplus-transformer_scl_zh-cn_16k-common",
+            "damo/speech_fsmn_vad_zh-cn-16k-common-pytorch",
+        )
     }
+
+
+def get_slugged_assets() -> list[ModelAsset]:
+    """Return support-model assets that expose a MODEL_PATH_<SLUG> override name.
+
+    Only models absent from models.json carry a slug; entries declared there are
+    addressed by their models.json key instead.
+    """
+    return [
+        asset
+        for asset in (
+            *_VAD_ASSETS,
+            *_DIARIZATION_ASSETS,
+            *_REALTIME_PARAFORMER_ASSETS,
+            _REALTIME_PUNC_ASSET,
+        )
+        if asset.slug is not None
+    ]
