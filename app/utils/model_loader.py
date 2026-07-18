@@ -395,6 +395,31 @@ def verify_required_models_integrity(use_logger: bool = True) -> dict[str, Any]:
     }
 
 
+def _preload_diarization_pool(result: dict, progress) -> None:
+    """Warm ALL diarization worker processes. FAIL THE BOOT on any error:
+    a swallowed failure here previously meant the first request paid a lazy
+    N-process build (or worse, silent VAD-only degradation). An initializer
+    crash surfaces as BrokenProcessPool with no cause text — the real
+    traceback is on the worker's stderr; the log line says so.
+    """
+    progress.update("加载说话人分离模型(CAM++ worker 进程池)")
+    from ..utils.speaker_diarizer import warmup_diarization_pool
+
+    try:
+        pool_size = warmup_diarization_pool()
+        result["speaker_diarization_model"]["loaded"] = True
+        logger.info("说话人分离进程池预热完成: %d workers", pool_size)
+    except Exception as e:
+        result["speaker_diarization_model"]["error"] = str(e)
+        logger.critical(
+            "说话人分离进程池预热失败，boot 中止（worker 真实 traceback 在其 stderr）: %s",
+            e,
+        )
+        raise
+    finally:
+        progress.advance("已完成说话人分离模型(CAM++)")
+
+
 def preload_models() -> dict[str, Any]:
     """
     Preload all required models after applying runtime filters.
@@ -530,24 +555,8 @@ def preload_models() -> dict[str, Any]:
                 logger.error("实时标点符号模型加载失败: %s", e)
             progress.advance("已完成标点符号模型(实时)")
 
-        # 5. Preload the required speaker diarization model (CAM++).
-        progress.update("加载说话人分离模型(CAM++)")
-        try:
-            from ..utils.speaker_diarizer import warmup_diarization_pool
-
-            # Build ALL N pool instances now, sequentially: modelscope
-            # pipeline() touches global registries and may download, and a
-            # lazy build at request time would pay N model loads on the
-            # first N requests.
-            pool_size = warmup_diarization_pool()
-            if pool_size >= 1:
-                result["speaker_diarization_model"]["loaded"] = True
-            else:
-                result["speaker_diarization_model"]["error"] = "说话人分离池为空"
-        except Exception as e:
-            result["speaker_diarization_model"]["error"] = str(e)
-            logger.error("说话人分离模型(CAM++)加载失败: %s", e)
-        progress.advance("已完成说话人分离模型(CAM++)")
+        # 5. Preload the required speaker diarization worker pool (CAM++).
+        _preload_diarization_pool(result, progress)
 
         # 6. Preload the ITN normalizer (wetext).
         # Its constructor loads FSTs for seconds while holding a global lock
