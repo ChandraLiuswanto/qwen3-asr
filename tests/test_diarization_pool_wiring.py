@@ -1,11 +1,9 @@
-"""Structure-only tests: the diarization request path checks a pipeline out
-of the pool for the duration of the pipeline call — acquire, then call (with
-torch.cuda.empty_cache suppressed for exactly that call), then release, in
-that order, the release in a finally. The ordering and the suppression window
-are asserted below with a shared event log and an empty_cache sentinel.
-These use fakes on CPU; they cannot prove GPU-concurrency safety —
-scripts/h100/test_offline_mixing.py is the real gate for that.
-"""
+# tests/test_diarization_pool_wiring.py
+"""Structure-only tests: SpeakerDiarizer.diarize() delegates to the
+process-pool manager and maps native triples onto SpeakerSegment. The
+empty_cache guard and per-instance exclusivity now live INSIDE workers
+(tests/test_diarization_worker.py, tests/test_diarization_process_pool.py);
+scripts/h100/test_offline_mixing.py stays the GPU-concurrency gate."""
 
 import os
 import subprocess
@@ -13,122 +11,45 @@ import sys
 import unittest
 from unittest import mock
 
-import torch
-
 from app.utils import speaker_diarizer as sd
+from app.utils.diarization_pool import DiarizationProcessPool
 
 
-class _FakePipeline:
-    """Records call order AND probes the empty_cache guard mid-call, the way
-    funasr does (it calls torch.cuda.empty_cache() after every inference)."""
-
-    def __init__(self, events) -> None:
-        self.events = events
-        self.calls = []
-
-    def __call__(self, audio_path):
-        self.events.append("call")
-        self.calls.append(audio_path)
-        # funasr-style: empty_cache during the pipeline call. The guard must
-        # suppress this (the sentinel installed in setUp must NOT record).
-        torch.cuda.empty_cache()
-        return {"text": [[0.0, 1.5, 0], [1.5, 3.0, 1]]}
-
-
-class DiarizationPoolWiringTest(unittest.TestCase):
-    def setUp(self) -> None:
-        # Sentinel + guard arrangement (same as tests/test_empty_cache_guard):
-        # replace torch.cuda.empty_cache with a recording lambda, force a
-        # fresh guard install over it, restore everything afterwards.
-        self._original_empty_cache = torch.cuda.empty_cache
-        self.sentinel_calls = []
-        torch.cuda.empty_cache = lambda: self.sentinel_calls.append(True)
-        sd._empty_cache_guard_installed = False
-        sd._install_empty_cache_guard()
-        self.addCleanup(self._restore_empty_cache)
-
-    def _restore_empty_cache(self) -> None:
-        torch.cuda.empty_cache = self._original_empty_cache
-        sd._empty_cache_guard_installed = False
-
-    def test_diarize_acquires_calls_and_releases(self) -> None:
-        events = []
-        fake = _FakePipeline(events)
-
-        def fake_acquire():
-            events.append("acquire")
-            return fake
-
-        def fake_release(pipeline):
-            self.assertIs(pipeline, fake)
-            events.append("release")
-
+class DiarizationWiringTest(unittest.TestCase):
+    def test_diarize_maps_triples_to_segments(self):
         with mock.patch.object(
-            sd._diarization_pool, "acquire", side_effect=fake_acquire
-        ) as acq, mock.patch.object(
-            sd._diarization_pool, "release", side_effect=fake_release
-        ) as rel:
+            sd._diarization_pool, "diarize", return_value=[(0.0, 1.5, 0), (1.5, 3.0, 1)]
+        ) as d:
             segments = sd.SpeakerDiarizer().diarize("/tmp/x.wav")
-
-        acq.assert_called_once_with()
-        rel.assert_called_once_with(fake)
-        # Exact ordering: checkout, then the pipeline call, then check-in.
-        self.assertEqual(events, ["acquire", "call", "release"])
-        # empty_cache was suppressed DURING the pipeline call...
-        self.assertEqual(len(self.sentinel_calls), 0)
-        # ...and is NOT suppressed outside diarize.
-        torch.cuda.empty_cache()
-        self.assertEqual(len(self.sentinel_calls), 1)
-        self.assertEqual(fake.calls, ["/tmp/x.wav"])
+        d.assert_called_once_with("/tmp/x.wav")
         self.assertEqual(len(segments), 2)
+        self.assertEqual(segments[0].start_ms, 0)
+        self.assertEqual(segments[0].end_ms, 1500)
         self.assertEqual(segments[0].speaker_id, "说话人1")
+        self.assertEqual(segments[1].speaker_id, "说话人2")
 
-    def test_release_happens_even_when_pipeline_raises(self) -> None:
-        broken = mock.Mock(side_effect=RuntimeError("cuda meltdown"))
-        with mock.patch.object(sd._diarization_pool, "acquire", return_value=broken), \
-             mock.patch.object(sd._diarization_pool, "release") as rel:
-            with self.assertRaises(Exception):
+    def test_too_short_fallback_survives_the_process_boundary(self):
+        err = AssertionError(
+            "modelscope error: The effective audio duration is too short."
+        )
+        with mock.patch.object(sd._diarization_pool, "diarize", side_effect=err), \
+             mock.patch.object(sd.librosa, "get_duration", return_value=5.0):
+            segments = sd.SpeakerDiarizer().diarize("/tmp/x.wav")
+        self.assertEqual(len(segments), 1)
+        self.assertEqual(segments[0].speaker_id, "说话人1")
+        self.assertEqual(segments[0].end_ms, 5000)
+
+    def test_other_worker_errors_become_server_errors(self):
+        with mock.patch.object(
+            sd._diarization_pool, "diarize", side_effect=RuntimeError("cuda meltdown")
+        ):
+            with self.assertRaises(Exception) as ctx:
                 sd.SpeakerDiarizer().diarize("/tmp/x.wav")
-        rel.assert_called_once_with(broken)
+        self.assertIn("说话人分离失败", str(ctx.exception))
 
-    def test_factory_installs_guard_and_stage_timing(self) -> None:
-        """_build_diarization_pipeline must install the empty_cache guard and
-        run the pipeline through _enable_stage_timing (setUp reset the guard
-        onto a fresh, unguarded sentinel, so the attribute check below can
-        only pass if the factory path itself performed the install)."""
-        # Undo setUp's install so the factory has to do it itself.
-        torch.cuda.empty_cache = lambda: self.sentinel_calls.append(True)
-        sd._empty_cache_guard_installed = False
-        self.assertFalse(
-            getattr(torch.cuda.empty_cache, "_diarization_guard", False)
-        )
-
-        fake_pipeline = object()
-        with mock.patch(
-            "app.infrastructure.model_utils.resolve_model_path",
-            return_value="/models/campplus",
-        ), mock.patch.object(
-            sd, "_resolve_modelscope_device", return_value="cpu"
-        ), mock.patch.object(
-            sd, "_create_modelscope_pipeline", return_value=fake_pipeline
-        ), mock.patch.object(
-            sd, "_enable_batched_sv", side_effect=lambda p, d, max_batch_size: p
-        ), mock.patch.object(
-            sd, "_enable_stage_timing", side_effect=lambda p: p
-        ) as timing_spy:
-            built = sd._build_diarization_pipeline()
-
-        self.assertIs(built, fake_pipeline)
-        self.assertIs(
-            getattr(torch.cuda.empty_cache, "_diarization_guard", False), True
-        )
-        timing_spy.assert_called_once_with(fake_pipeline)
-
-    def test_pool_sized_from_settings(self) -> None:
-        # Subprocess, not in-process: the module-level pool is built from
-        # settings at import time, so only a fresh interpreter with the env
-        # var set can prove the size is wired to DIARIZATION_POOL_SIZE
-        # rather than hardcoded.
+    def test_pool_is_process_pool_sized_from_settings(self):
+        self.assertIsInstance(sd._diarization_pool, DiarizationProcessPool)
+        # Fresh interpreter: the module-level pool reads settings at import.
         repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         result = subprocess.run(
             [
@@ -143,14 +64,23 @@ class DiarizationPoolWiringTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0)
 
-    def test_global_singleton_accessor_is_gone(self) -> None:
-        self.assertFalse(hasattr(sd, "get_global_diarization_pipeline"))
-
-    def test_warmup_builds_all_n(self) -> None:
-        with mock.patch.object(sd._diarization_pool, "warmup") as warm:
+    def test_warmup_starts_pool_and_returns_size(self):
+        with mock.patch.object(sd._diarization_pool, "start") as start:
             n = sd.warmup_diarization_pool()
-        warm.assert_called_once_with()
+        start.assert_called_once_with()
         self.assertEqual(n, sd._diarization_pool.size)
+
+    def test_close_hook_delegates_to_pool(self):
+        with mock.patch.object(sd._diarization_pool, "close") as close:
+            sd.close_diarization_pool()
+        close.assert_called_once_with()
+
+    def test_threaded_engine_pool_is_gone_from_this_module(self):
+        self.assertFalse(hasattr(sd, "ThreadedEnginePool"))
+
+    def test_boot_timeout_setting_exists(self):
+        from app.core.config import settings
+        self.assertGreaterEqual(settings.DIARIZATION_BOOT_TIMEOUT_S, 1)
 
 
 if __name__ == "__main__":

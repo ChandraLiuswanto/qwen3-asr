@@ -86,19 +86,24 @@ class Settings:
     QWEN_RUST_CPU_WORKERS: int = 4
     FUNASR_WORKERS: int = 1
     # 不变量：必须保持 VLLM_OFFLINE_CONCURRENCY <= DIARIZATION_POOL_SIZE
-    # （见下方 DIARIZATION_POOL_SIZE 的说明），否则 executor 线程会阻塞等待
-    # pipeline 实例。
+    # （见下方 DIARIZATION_POOL_SIZE 的说明），否则超额请求的 executor 线程
+    # 会阻塞在进程池 .result() 上等 worker 空闲（.result() 仍然阻塞调用线程，
+    # 和旧 checkout 一样占着线程，只是排队发生在进程池队列里）。
     VLLM_OFFLINE_CONCURRENCY: int = 4
     VLLM_WS_DECODE_CONCURRENCY: int = 4
 
-    # CAM++ 说话人分离 pipeline 池大小。每个实例独立持有模型权重与 CUDA
-    # 缓存 —— 生产环境的取值必须以 H100 上 nvidia-smi 实测的单实例显存增量
-    # 为准（见 docs/superpowers/specs/2026-07-17-diarization-throughput-design.md），
+    # CAM++ 说话人分离 worker 进程数（change D：每个 worker 进程独立持有
+    # 一份 pipeline，进程即实例 —— GIL 不再是并行上限）。生产取值必须以
+    # H100 上 nvidia-smi 实测的单 worker 显存增量为准（gate G1，见
+    # docs/superpowers/specs/2026-07-18-procpool-diarization-asyncllm-design.md），
     # 不要凭空调大。
-    # 不变量：必须保持 VLLM_OFFLINE_CONCURRENCY <= DIARIZATION_POOL_SIZE，
-    # 否则 executor 线程会阻塞在 queue.Queue.get() 上等 pipeline，
-    # 占着并发额度饿死其他请求（与 change A 治理过的饥饿同类）。
+    # 不变量：保持 VLLM_OFFLINE_CONCURRENCY <= DIARIZATION_POOL_SIZE。
+    # 超额请求的 executor 线程仍会阻塞在进程池 .result() 上等 worker 空闲
+    # （和旧 checkout 一样占着线程），只是排队发生在进程池队列里。
     DIARIZATION_POOL_SIZE: int = 4
+    # 进程池 boot 预热超时（秒）：全部 worker 建完 pipeline 的 Barrier 等待
+    # 上限。冷缓存首次下载模型时最慢 —— 超时会导致 boot 失败（响亮，不降级）。
+    DIARIZATION_BOOT_TIMEOUT_S: int = 300
 
     def __init__(self):
         """从环境变量读取配置"""
@@ -169,16 +174,19 @@ class Settings:
         self.DIARIZATION_POOL_SIZE = self._positive_int_from_env(
             "DIARIZATION_POOL_SIZE", self.DIARIZATION_POOL_SIZE
         )
+        self.DIARIZATION_BOOT_TIMEOUT_S = self._positive_int_from_env(
+            "DIARIZATION_BOOT_TIMEOUT_S", self.DIARIZATION_BOOT_TIMEOUT_S
+        )
         if self.VLLM_OFFLINE_CONCURRENCY > self.DIARIZATION_POOL_SIZE:
-            # Documented invariant (spec: blocking queue.Queue.get() holds an
+            # Documented invariant (spec: blocking .result() holds an
             # executor slot). Warn loudly rather than refuse to boot: the
             # operator may run with diarization disabled per-request.
             import logging
 
             logging.getLogger(__name__).warning(
                 "VLLM_OFFLINE_CONCURRENCY (%d) > DIARIZATION_POOL_SIZE (%d): "
-                "diarization-enabled requests may block executor threads "
-                "waiting for a pipeline instance",
+                "over-admitted diarization requests block their executor "
+                "thread on the process-pool result until a worker frees up",
                 self.VLLM_OFFLINE_CONCURRENCY,
                 self.DIARIZATION_POOL_SIZE,
             )
