@@ -28,6 +28,15 @@ class DiarizationProcessPool:
         self._executor: Optional[ProcessPoolExecutor] = None
         self._lock = threading.Lock()
         self._starting = False
+        # Set once by close(); makes the pool un-resurrectable and lets a
+        # concurrent start() (boot or rebuild) detect a close that landed
+        # mid-build and tear down its own fresh executor instead of orphaning
+        # a fresh batch of CUDA worker processes past shutdown.
+        self._closing = False
+        # Handle to the most recent off-thread rebuild worker. Exposed so a
+        # request that hit BrokenProcessPool does not block on the rebuild;
+        # tests join it to synchronize deterministically.
+        self._rebuild_thread: Optional[threading.Thread] = None
 
     @property
     def size(self) -> int:
@@ -52,9 +61,15 @@ class DiarizationProcessPool:
         The blocking warmup runs OUTSIDE self._lock (a rebuild must not make
         close() wait minutes for the lock); the lock only guards publishing.
         Raises on failure — the caller (boot) must NOT swallow this.
+
+        Publish is atomic vs close(): the _closing check and the publish share
+        ONE lock acquisition, so either start() publishes before close() flips
+        the flag (close() then tears the published pool down) or close() flips
+        first (start() sees it under the lock and tears down its OWN fresh
+        executor) — never an orphan.
         """
         with self._lock:
-            if self._executor is not None or self._starting:
+            if self._executor is not None or self._starting or self._closing:
                 return
             self._starting = True
         try:
@@ -91,6 +106,12 @@ class DiarizationProcessPool:
                 executor.shutdown(wait=False, cancel_futures=True)
                 raise
             with self._lock:
+                if self._closing:
+                    # close() landed while we were building. Tear down the
+                    # fresh, un-published executor instead of orphaning its
+                    # workers; close() saw _executor=None so it is our job.
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    return
                 self._executor = executor
             logger.info("Diarization process pool ready: {} workers", self._size)
         finally:
@@ -103,7 +124,10 @@ class DiarizationProcessPool:
         Worker exceptions re-raise here with their original type and message
         (pickled), so SpeakerDiarizer's "too short" string match still works.
         BrokenProcessPool triggers ONE rebuild for future requests; the
-        request that hit the break fails — no silent retry.
+        request that hit the break FAILS FAST — it raises immediately and the
+        rebuild runs on a background daemon thread, so this request never
+        blocks up to DIARIZATION_BOOT_TIMEOUT_S (nor holds its admission slot)
+        while N workers respawn and reload models. No silent retry.
         """
         executor = self._executor
         if executor is None:
@@ -116,11 +140,20 @@ class DiarizationProcessPool:
             ).result()
         except BrokenProcessPool as e:
             logger.critical(
-                "Diarization worker pool broke ({}); attempting one rebuild. "
+                "Diarization worker pool broke ({}); rebuilding off-thread. "
                 "Worker traceback is on worker stderr.",
                 e,
             )
-            self._rebuild(executor)
+            # Rebuild off the request thread. _rebuild's compare-and-swap
+            # keeps rebuild-once: even if several broken requests each launch
+            # a thread, only the one that finds _executor still == this broken
+            # executor rebuilds; the rest are cheap no-ops. daemon=True so a
+            # rebuild in flight can never block process exit.
+            thread = threading.Thread(
+                target=self._rebuild, args=(executor,), daemon=True
+            )
+            self._rebuild_thread = thread
+            thread.start()
             raise DefaultServerErrorException(
                 "说话人分离进程池崩溃，本请求失败（池已尝试重建）"
             ) from e
@@ -142,7 +175,13 @@ class DiarizationProcessPool:
             )
 
     def close(self) -> None:
+        # Flip _closing and swap the executor out under ONE lock acquisition.
+        # This is the other half of start()'s atomic publish: if a rebuild is
+        # mid-build, either we see and tear down its published executor here,
+        # or it sees _closing under the lock at publish and tears down its own
+        # fresh executor — never an orphaned CUDA-worker batch past shutdown.
         with self._lock:
+            self._closing = True
             executor, self._executor = self._executor, None
         if executor is not None:
             executor.shutdown(wait=True, cancel_futures=True)
