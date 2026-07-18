@@ -3,7 +3,7 @@
 
 The worker process is the instance: exclusivity is structural (a
 ProcessPoolExecutor worker runs one task at a time). This replaces the
-ThreadedEnginePool checkout mutex, which could not scale past the GIL.
+in-process thread-pool checkout mutex, which could not scale past the GIL.
 """
 
 from __future__ import annotations

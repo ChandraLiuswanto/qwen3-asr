@@ -42,7 +42,8 @@ def _install_empty_cache_guard() -> None:
 
     Acquires `_diarization_pipeline_lock` (non-reentrant). MUST NOT be called
     while that lock is already held or it will deadlock. (Safe from
-    `_build_diarization_pipeline`: the pool's init lock is a different lock.)
+    `_build_diarization_pipeline`: that function never holds
+    `_diarization_pipeline_lock` itself before calling here.)
     """
     global _empty_cache_guard_installed, _empty_cache_tls
     with _diarization_pipeline_lock:
