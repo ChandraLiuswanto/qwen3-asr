@@ -19,7 +19,7 @@ import torch
 
 from ..core.config import settings
 from ..core.exceptions import DefaultServerErrorException
-from ..services.asr.runtime.local_pool import ThreadedEnginePool
+from .diarization_pool import DiarizationProcessPool
 
 # 仅用于 _install_empty_cache_guard 的一次性安装（历史上还保护过单例加载）
 _diarization_pipeline_lock = threading.Lock()
@@ -323,15 +323,13 @@ def _enable_stage_timing(pipeline_instance: Any) -> Any:
 def _build_diarization_pipeline() -> Any:
     """Build ONE independent CAM++ pipeline instance (weights + batched SV).
 
-    Called by the pool factory under the pool's init lock, so construction is
-    sequential — modelscope `pipeline()` touches global registries and may
-    download on first run; building N concurrently is a race.
-
-    Each instance is fully independent (own sv/vad/change_locator children,
-    per-instance MethodType patch). funasr mutates shared per-instance state
-    on every call (auto_model.py kwargs, fsmn_vad is_final toggling), so an
-    instance must NEVER be visible to two concurrent requests: the pool
-    checkout is the mutex that replaced _diarization_inference_semaphore.
+    Runs INSIDE a diarization worker process only (see
+    app/utils/diarization_worker.py). Each instance is fully independent
+    (own sv/vad/change_locator children, per-instance MethodType patch).
+    funasr mutates shared per-instance state on every call, so an instance
+    must never be visible to two concurrent requests — the worker process
+    IS the instance, and a ProcessPoolExecutor worker runs one task at a
+    time, so exclusivity is structural.
     """
     _install_empty_cache_guard()
     try:
@@ -365,15 +363,23 @@ def _build_diarization_pipeline() -> Any:
         raise DefaultServerErrorException(f"说话人分离模型加载失败: {str(e)}")
 
 
-_diarization_pool: ThreadedEnginePool[Any] = ThreadedEnginePool(
-    settings.DIARIZATION_POOL_SIZE, _build_diarization_pipeline
+_diarization_pool: DiarizationProcessPool = DiarizationProcessPool(
+    settings.DIARIZATION_POOL_SIZE, settings.DIARIZATION_BOOT_TIMEOUT_S
 )
 
 
 def warmup_diarization_pool() -> int:
-    """Eagerly build all N pipeline instances (startup warmup). Returns N."""
-    _diarization_pool.warmup()
+    """Spawn and warm ALL worker processes (startup). Raises on failure —
+    the boot path must let that propagate (fail loud, never degrade)."""
+    _diarization_pool.start()
     return _diarization_pool.size
+
+
+def close_diarization_pool() -> None:
+    """Shut the worker pool down explicitly. Called from the app lifespan
+    shutdown — relying on atexit alone can hang on workers still parked at
+    an aborted boot barrier."""
+    _diarization_pool.close()
 
 
 class SpeakerDiarizer:
@@ -405,44 +411,22 @@ class SpeakerDiarizer:
         """
         try:
             logger.info(f"开始说话人分离: {audio_path}")
-            # Checkout = per-instance mutex: this instance is ours alone
-            # until release. funasr mutates instance state per call, so the
-            # instance must not be shared; the finally makes leaks impossible
-            # even when the pipeline raises (e.g. "too short" audio).
-            # Bind the pool once: a module reload rebinds the global, and
-            # acquire/release must target the same pool object.
+            # The worker process is the instance: exclusivity is structural
+            # (one task per worker), so there is no checkout/release here.
+            # Bind the pool once: a module reload rebinds the global.
             pool = _diarization_pool
-            pipeline = pool.acquire()
-            try:
-                with _suppress_empty_cache():
-                    result = pipeline(audio_path)
-            finally:
-                pool.release(pipeline)
+            triples = pool.diarize(audio_path)
 
-            # 解析结果: {'text': [[start, end, speaker_id], ...]}
-            # pipeline 返回类型不确定，需要安全地获取 'text' 字段
-            if isinstance(result, dict):
-                raw_output = result.get('text', [])
-            else:
-                raw_output = getattr(result, 'text', []) or []
-
-            segments = []
-            for seg in raw_output:
-                if isinstance(seg, list) and len(seg) == 3:
-                    try:
-                        start_ms = int(float(seg[0]) * 1000)
-                        end_ms = int(float(seg[1]) * 1000)
-                        speaker_id = f"说话人{int(seg[2]) + 1}"
-                        segments.append(SpeakerSegment(
-                            start_ms=start_ms,
-                            end_ms=end_ms,
-                            speaker_id=speaker_id,
-                        ))
-                    except (ValueError, TypeError) as e:
-                        logger.warning(f"跳过格式错误的片段: {seg}, 错误: {e}")
+            segments = [
+                SpeakerSegment(
+                    start_ms=int(start_sec * 1000),
+                    end_ms=int(end_sec * 1000),
+                    speaker_id=f"说话人{label + 1}",
+                )
+                for (start_sec, end_sec, label) in triples
+            ]
 
             logger.info(f"说话人分离完成，原始片段数: {len(segments)}")
-            # 诊断日志：打印前20个原始片段
             for i, seg in enumerate(segments[:20]):
                 logger.debug(
                     f"[CAM++原始] #{i}: {seg.start_sec:.2f}-{seg.end_sec:.2f}s "

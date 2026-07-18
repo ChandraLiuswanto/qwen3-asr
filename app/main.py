@@ -109,6 +109,8 @@ async def lifespan(app: FastAPI):
 
     # 关闭时
     logger.info(f"Worker [{worker_id}] 正在关闭推理线程池...")
+    from .utils.speaker_diarizer import close_diarization_pool
+    close_diarization_pool()
     shutdown_executor()
     logger.info(f"Worker [{worker_id}] 已关闭")
 
