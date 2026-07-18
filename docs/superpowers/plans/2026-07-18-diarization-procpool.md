@@ -92,13 +92,28 @@ class WorkerDiarizeTest(unittest.TestCase):
             dw._worker_diarize("/tmp/x.wav")
 
     def test_pipeline_exception_propagates_untouched(self):
-        dw._pipeline = _FakePipeline(None)
-        dw._pipeline.__class__.__call__ = lambda self, p: (_ for _ in ()).throw(
-            AssertionError("modelscope error: The effective audio duration is too short.")
-        )
+        # Throwaway subclass — never mutate _FakePipeline itself, that would
+        # poison later tests that instantiate it.
+        class _Raising(_FakePipeline):
+            def __call__(self, audio_path):
+                raise AssertionError(
+                    "modelscope error: The effective audio duration is too short."
+                )
+
+        dw._pipeline = _Raising(None)
         with self.assertRaises(AssertionError) as ctx:
             dw._worker_diarize("/tmp/x.wav")
         self.assertIn("too short", str(ctx.exception))
+
+    def test_fake_mode_refuses_non_cpu_device(self):
+        # DIARIZATION_WORKER_FAKE is a test-only escape hatch: it must never
+        # silently fake diarization on a real (cuda) deployment.
+        from unittest import mock
+        with mock.patch.dict(
+            "os.environ", {"DIARIZATION_WORKER_FAKE": "1", "DEVICE": "cuda"}
+        ):
+            with self.assertRaises(RuntimeError):
+                dw._build_pipeline()
 
     def test_fake_worker_pipeline_shape(self):
         result = dw._FakeWorkerPipeline()("/tmp/x.wav")
@@ -170,6 +185,12 @@ def _configure_worker_logging() -> None:
 
 def _build_pipeline() -> Any:
     if os.getenv("DIARIZATION_WORKER_FAKE") == "1":
+        if os.getenv("DEVICE", "").lower() != "cpu":
+            raise RuntimeError(
+                "DIARIZATION_WORKER_FAKE=1 is test-only and refuses to run "
+                "with DEVICE != cpu — a stray production value must fail the "
+                "boot, not silently fake diarization."
+            )
         return _FakeWorkerPipeline()
     # Force modelscope task registration BEFORE building — without this the
     # speaker-diarization task can be unregistered and pipeline() falls
@@ -375,7 +396,8 @@ from __future__ import annotations
 
 import multiprocessing
 import threading
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import FIRST_EXCEPTION, ProcessPoolExecutor
+from concurrent.futures import wait as futures_wait
 from concurrent.futures.process import BrokenProcessPool
 from typing import List, Optional, Tuple
 
@@ -391,6 +413,7 @@ class DiarizationProcessPool:
         self._boot_timeout_s = boot_timeout_s
         self._executor: Optional[ProcessPoolExecutor] = None
         self._lock = threading.Lock()
+        self._starting = False
 
     @property
     def size(self) -> int:
@@ -402,13 +425,25 @@ class DiarizationProcessPool:
         Structural fan-out: N probe submits each force a spawn, because every
         already-spawned worker is parked on the barrier inside _worker_init
         (never idle, so ProcessPoolExecutor cannot reuse it). Barrier parties
-        = N + 1 (the parent); release therefore means all N pipelines exist.
-        The distinct-PID check is belt and braces on that mechanism.
-        Raises on timeout/failure — the caller (boot) must NOT swallow this.
+        = N + 1 (the parent); release therefore means all N pipelines exist —
+        the barrier alone is the proof (no PID counting: probes have no
+        task-to-worker affinity and a PID check is scheduling-flaky).
+
+        FAIL FAST on worker death: a worker whose initializer raises never
+        reaches the barrier, and its probe future fails with
+        BrokenProcessPool almost immediately — a watcher thread aborts the
+        barrier on FIRST_EXCEPTION so the parent does not sit out the full
+        boot timeout. The timeout covers only genuinely wedged spawns.
+
+        The blocking warmup runs OUTSIDE self._lock (a rebuild must not make
+        close() wait minutes for the lock); the lock only guards publishing.
+        Raises on failure — the caller (boot) must NOT swallow this.
         """
         with self._lock:
-            if self._executor is not None:
+            if self._executor is not None or self._starting:
                 return
+            self._starting = True
+        try:
             ctx = multiprocessing.get_context("spawn")
             barrier = ctx.Barrier(self._size + 1)
             executor = ProcessPoolExecutor(
@@ -422,19 +457,31 @@ class DiarizationProcessPool:
                     executor.submit(diarization_worker._worker_probe)
                     for _ in range(self._size)
                 ]
-                barrier.wait(timeout=self._boot_timeout_s)
-                pids = {p.result(timeout=self._boot_timeout_s) for p in probes}
-                if len(pids) != self._size:
-                    raise RuntimeError(
-                        "diarization pool warmup: expected "
-                        f"{self._size} distinct workers, got {len(pids)}"
+
+                def _abort_on_worker_death() -> None:
+                    done_or_failed = futures_wait(
+                        probes, return_when=FIRST_EXCEPTION
                     )
+                    if any(f.exception() is not None for f in done_or_failed.done):
+                        barrier.abort()
+
+                watcher = threading.Thread(
+                    target=_abort_on_worker_death, daemon=True
+                )
+                watcher.start()
+                barrier.wait(timeout=self._boot_timeout_s)
+                for p in probes:
+                    p.result(timeout=self._boot_timeout_s)
             except Exception:
                 barrier.abort()
                 executor.shutdown(wait=False, cancel_futures=True)
                 raise
-            self._executor = executor
+            with self._lock:
+                self._executor = executor
             logger.info("Diarization process pool ready: {} workers", self._size)
+        finally:
+            with self._lock:
+                self._starting = False
 
     def diarize(self, audio_path: str) -> List[Tuple[float, float, int]]:
         """Submit one diarization to a worker and block for the result.
@@ -506,8 +553,9 @@ git commit -m "feat: DiarizationProcessPool — barrier warmup, rebuild-once, sp
 ### Task 3: Rewire SpeakerDiarizer onto the process pool
 
 **Files:**
-- Modify: `app/utils/speaker_diarizer.py` (imports at :22, pool global at :368-376, `diarize()` body at :395-451; keep the "too short" except-path at :453-477 verbatim)
-- Modify: `app/core/config.py` (add `DIARIZATION_BOOT_TIMEOUT_S`, update the `DIARIZATION_POOL_SIZE` comment block at :94-101)
+- Modify: `app/utils/speaker_diarizer.py` (imports at :22, pool global at :368-376, `diarize()` body at :395-451; keep the "too short" except-path at :453-477 verbatim; FULL docstring rewrite of `_build_diarization_pipeline`)
+- Modify: `app/core/config.py` (add `DIARIZATION_BOOT_TIMEOUT_S`, update the `DIARIZATION_POOL_SIZE` comment block at :94-101, fix the stale warning text at :179-181 and cross-ref comment at :88-90)
+- Modify: `app/main.py` (lifespan shutdown: close the pool)
 - Test: rewrite `tests/test_diarization_pool_wiring.py`
 
 **Interfaces:**
@@ -591,6 +639,11 @@ class DiarizationWiringTest(unittest.TestCase):
         start.assert_called_once_with()
         self.assertEqual(n, sd._diarization_pool.size)
 
+    def test_close_hook_delegates_to_pool(self):
+        with mock.patch.object(sd._diarization_pool, "close") as close:
+            sd.close_diarization_pool()
+        close.assert_called_once_with()
+
     def test_threaded_engine_pool_is_gone_from_this_module(self):
         self.assertFalse(hasattr(sd, "ThreadedEnginePool"))
 
@@ -618,19 +671,20 @@ In the class body, replace the `DIARIZATION_POOL_SIZE` comment block (keep the f
     # H100 上 nvidia-smi 实测的单 worker 显存增量为准（gate G1，见
     # docs/superpowers/specs/2026-07-18-procpool-diarization-asyncllm-design.md），
     # 不要凭空调大。
-    # 不变量：保持 VLLM_OFFLINE_CONCURRENCY <= DIARIZATION_POOL_SIZE，
-    # 否则超额请求在进程池队列中排队（不再占死 executor 线程，但仍是队头阻塞）。
+    # 不变量：保持 VLLM_OFFLINE_CONCURRENCY <= DIARIZATION_POOL_SIZE。
+    # 超额请求的 executor 线程仍会阻塞在进程池 .result() 上等 worker 空闲
+    # （和旧 checkout 一样占着线程），只是排队发生在进程池队列里。
     DIARIZATION_POOL_SIZE: int = 4
     # 进程池 boot 预热超时（秒）：全部 worker 建完 pipeline 的 Barrier 等待
     # 上限。冷缓存首次下载模型时最慢 —— 超时会导致 boot 失败（响亮，不降级）。
     DIARIZATION_BOOT_TIMEOUT_S: int = 300
 ```
 
-In `_load_from_env`, next to the existing `DIARIZATION_POOL_SIZE` load, add:
+In `_load_from_env`, next to the existing `DIARIZATION_POOL_SIZE` load (which uses `self._positive_int_from_env` — follow the same pattern so 0/negative fails the boot loudly per invariant 4):
 
 ```python
-        self.DIARIZATION_BOOT_TIMEOUT_S = int(
-            os.getenv("DIARIZATION_BOOT_TIMEOUT_S", str(self.DIARIZATION_BOOT_TIMEOUT_S))
+        self.DIARIZATION_BOOT_TIMEOUT_S = self._positive_int_from_env(
+            "DIARIZATION_BOOT_TIMEOUT_S", self.DIARIZATION_BOOT_TIMEOUT_S
         )
 ```
 
@@ -686,7 +740,39 @@ def warmup_diarization_pool() -> int:
             return segments
 ```
 
-(d) The functions `_build_diarization_pipeline`, `_create_modelscope_pipeline`, `_enable_batched_sv`, `_enable_stage_timing`, `_install_empty_cache_guard`, `_suppress_empty_cache` all STAY in this module — they now execute only inside worker processes (imported lazily by `diarization_worker`). Update `_build_diarization_pipeline`'s docstring first line to: `"""Build ONE independent CAM++ pipeline instance — runs INSIDE a diarization worker process (see app/utils/diarization_worker.py)."""`
+(d) The functions `_build_diarization_pipeline`, `_create_modelscope_pipeline`, `_enable_batched_sv`, `_enable_stage_timing`, `_install_empty_cache_guard`, `_suppress_empty_cache` all STAY in this module — they now execute only inside worker processes (imported lazily by `diarization_worker`). Replace `_build_diarization_pipeline`'s ENTIRE docstring (its old text references the retired pool init lock and `_diarization_inference_semaphore`, which would trip Task 6's grep) with:
+
+```python
+    """Build ONE independent CAM++ pipeline instance (weights + batched SV).
+
+    Runs INSIDE a diarization worker process only (see
+    app/utils/diarization_worker.py). Each instance is fully independent
+    (own sv/vad/change_locator children, per-instance MethodType patch).
+    funasr mutates shared per-instance state on every call, so an instance
+    must never be visible to two concurrent requests — the worker process
+    IS the instance, and a ProcessPoolExecutor worker runs one task at a
+    time, so exclusivity is structural.
+    """
+```
+
+(e) Add a module-level close hook (used by app shutdown, wired in step 4f) below `warmup_diarization_pool`:
+
+```python
+def close_diarization_pool() -> None:
+    """Shut the worker pool down explicitly. Called from the app lifespan
+    shutdown — relying on atexit alone can hang on workers still parked at
+    an aborted boot barrier."""
+    _diarization_pool.close()
+```
+
+(f) In `app/main.py`, in the lifespan shutdown block (the lines calling `shutdown_executor()`, currently ~:110-113), add immediately before it:
+
+```python
+    from app.utils.speaker_diarizer import close_diarization_pool
+    close_diarization_pool()
+```
+
+(g) Also in `app/core/config.py`: update the TWO stale companion texts the new comment would otherwise contradict — the boot-warning message at :179-181 (replace "may block executor threads waiting for a pipeline instance" phrasing with "over-admitted diarization requests block their executor thread on the process-pool result until a worker frees up") and the `VLLM_OFFLINE_CONCURRENCY` cross-reference comment at :88-90 (same correction). The truth to state everywhere: `.result()` STILL blocks the executor thread; the invariant holds for the same reason as before.
 
 - [ ] **Step 5: Run tests to verify pass**
 
@@ -859,6 +945,8 @@ DIARIZATION_BOOT_TIMEOUT_S=300
 DIARIZATION_WORKER_LOG_LEVEL=INFO
 ```
 
+Also update the existing `DIARIZATION_STAGE_TIMINGS` comment block in `.env.example` (it currently implies the `[diarization-profile]` lines land in the server log): append the sentence `# NOTE (change D): these lines are now emitted by WORKER processes on their stderr, not in the parent's LOG_FILE — capture stderr (systemd/docker) to read them.`
+
 - [ ] **Step 4: Full suite, commit**
 
 Run: `DEVICE=cpu .venv/bin/python -m unittest discover -s tests` → green.
@@ -878,8 +966,8 @@ git commit -m "chore: retire ThreadedEnginePool; document process-pool env knobs
 
 Run all of:
 - `DEVICE=cpu .venv/bin/python -m unittest discover -s tests` → green, count recorded.
-- `grep -rn "ThreadedEnginePool\|_diarization_inference_semaphore" app` → no output.
-- `.venv/bin/python -c "import app.utils.diarization_worker"` → imports clean and fast (top level must not pull torch/modelscope — verify by adding `-X importtime` and checking no modelscope entry).
+- `grep -rn "ThreadedEnginePool\|_diarization_inference_semaphore" app` → no output (Task 3 step 4d rewrote the whole `_build_diarization_pipeline` docstring, so no stale reference survives).
+- `.venv/bin/python -X importtime -c "import app.utils.diarization_worker" 2>&1 | grep -E "modelscope|funasr|vllm"` → no output. NOTE: torch/torchaudio WILL appear — `app/utils/__init__.py` imports `.audio` which imports torch at top level; that is expected and not a failure. The discipline being checked is: no modelscope, no funasr, no vLLM/engine stack at import time.
 
 - [ ] **Step 2: Request code review**
 
@@ -891,6 +979,14 @@ Per house process: dispatch the final whole-branch review (superpowers:requestin
 bd create --title="Change D: diarization process pool (plan 2026-07-18)" \
   --description="Implements spec docs/superpowers/specs/2026-07-18-procpool-diarization-asyncllm-design.md change D via plan docs/superpowers/plans/2026-07-18-diarization-procpool.md. Local tasks 1-6 done on feat/diarization-procpool. H100 gates G0+G1 BLOCK the merge." \
   --type=feature --priority=1
+bd create --title="G3: 16-concurrent load gate (Phase 2, both changes live)" \
+  --description="Spec 2026-07-18 gate G3: bench level [16] with change D + change C live; record p50/p95/fails; SLO judgment belongs to the service owner. Filed during Phase 1 so it cannot fall between the two plans." \
+  --type=task --priority=1
+# Closing verdict on the superseded thread-pool approach (spec Rollout item 3):
+bd close qwen3-asr-2vs --reason="Thread-pool diarization measured GIL-bound on H100 2026-07-18 (preprocess 15.3-17.7s x10 at n=10, lockstep completion = GIL round-robin; n=10 wall 35.5s vs 12.8s serialized baseline). Superseded by spec 2026-07-18 change D (process pool). Stage-timing evidence in the spec's Problem section."
+# qwen3-asr-9nk: dispositioned by change D (registration import + loud boot);
+# leave OPEN with a comment until G1 verifies both loud-failure drills:
+bd update qwen3-asr-9nk --notes="Fix shipped in change D (feat/diarization-procpool): modelscope.pipelines.audio registration import in worker init + boot fails loudly on warmup failure. Close after G1's two boot-failure drills verify."
 git add .beads/ && git commit -m "chore: beads export (change D local scope)"
 ```
 
@@ -900,9 +996,11 @@ git add .beads/ && git commit -m "chore: beads export (change D local scope)"
 
 Not executable on the dev box. On the H100, from this branch:
 
-- [ ] **G0 baseline (current main):** restart server from main with `DIARIZATION_POOL_SIZE=4 VLLM_OFFLINE_CONCURRENCY=4`, run `scripts/h100/bench.sh` levels [1,2,4,8,10,16]; record wall/req/s/p50/p95.
-- [ ] **G1 (this branch):** deploy branch, same knobs, `DIARIZATION_STAGE_TIMINGS=true`. Verify boot log shows the pool-ready line with 4 workers (and that a deliberately broken config — e.g. `DIARIZATION_BOOT_TIMEOUT_S=1` — fails the boot loudly, then restore). Run the same bench plus `scripts/h100/test_offline_mixing.py`. Pass criteria (spec): per-call `preprocess` at n=10 ≈ its n=1 time (GIL-escape proof, read from worker stderr `[diarization-profile]` lines); zero failures; per-worker VRAM recorded via `nvidia-smi` deltas across pool start → choose production `DIARIZATION_POOL_SIZE` from it.
-- [ ] Record both verdicts in the bd issue; merge only after both recorded.
+- [ ] **MIGRATION (before anything):** edit the H100 deployment `.env` — it currently carries `DIARIZATION_POOL_SIZE=16` from the thread-pool era. The knob now means **worker processes**; 16 would spawn 16 model-loading CUDA processes at boot and likely OOM. Set `DIARIZATION_POOL_SIZE=4` and `VLLM_OFFLINE_CONCURRENCY=4` for both gates.
+- [ ] **Launch so worker stderr is captured** (systemd/docker/redirected terminal): the `[diarization-profile]` lines G1 reads are emitted on WORKER stderr, not in the parent's `LOG_FILE`.
+- [ ] **G0 baseline (current main):** restart server from main with the knobs above, run `scripts/h100/bench.sh` levels [1,2,4,8,10,16]; record wall/req/s/p50/p95.
+- [ ] **G1 (this branch):** deploy branch, same knobs, `DIARIZATION_STAGE_TIMINGS=true`. Verify boot log shows the pool-ready line with 4 workers. Run BOTH loud-boot drills, then restore: (a) timeout path — `DIARIZATION_BOOT_TIMEOUT_S` set low enough to trip during pipeline build (e.g. 1) → boot must fail loudly; (b) initializer-exception path — point the CAM++ model path at a bogus location → boot must fail fast with `BrokenProcessPool` and the error message must direct the operator to worker stderr (this is the actual qwen3-asr-9nk fix being proven). Run the same bench plus `scripts/h100/test_offline_mixing.py`. Pass criteria (spec): per-call `preprocess` at n=10 ≈ its n=1 time (GIL-escape proof, from worker-stderr `[diarization-profile]` lines); zero failures; per-worker VRAM recorded via `nvidia-smi` deltas across pool start → choose production `DIARIZATION_POOL_SIZE` from it.
+- [ ] Record both verdicts in the bd issue (and close qwen3-asr-9nk if both drills passed); merge only after both recorded.
 
 ---
 
